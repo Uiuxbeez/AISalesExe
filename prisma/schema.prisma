@@ -1,0 +1,115 @@
+// AI Sales Executive - Foundation Schema (Phase 1)
+//
+// Scope note: this schema only models the data shapes needed for the
+// application foundation. No business logic, no webhooks, no AI calls.
+// Fields are intentionally generous (e.g. userId on every table) so that
+// multi-tenancy (Phase 2+) can be introduced without reshaping tables.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// A tenant/business account. Phase 1 ships with a single dummy user.
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  instagramSettings InstagramSettings?
+  aiSettings        AISettings?
+  conversations     Conversation[]
+  webhookLogs       WebhookLog[]
+
+  @@map("users")
+}
+
+/// Instagram connection details for a business account.
+/// Populated later in the Instagram OAuth phase; UI-only for now.
+model InstagramSettings {
+  id                String   @id @default(cuid())
+  userId            String   @unique
+  username          String?
+  businessAccountId String?
+  accessToken       String?
+  isConnected       Boolean  @default(false)
+  lastVerifiedAt    DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("instagram_settings")
+}
+
+/// AI Brain configuration for a business account.
+/// Populated later in the AI integration phase; UI-only for now.
+model AISettings {
+  id           String   @id @default(cuid())
+  userId       String   @unique
+  openAiApiKey String?
+  temperature  Float    @default(0.7)
+  maxTokens    Int      @default(512)
+  systemPrompt String?  @db.Text
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("ai_settings")
+}
+
+/// A DM thread with a single end customer.
+model Conversation {
+  id              String    @id @default(cuid())
+  userId          String
+  customerName    String
+  customerHandle  String?
+  customerAvatar  String?
+  lastMessageAt   DateTime?
+  status          String    @default("open") // open | pending | closed
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@index([userId])
+  @@map("conversations")
+}
+
+/// A single message inside a conversation.
+model Message {
+  id             String   @id @default(cuid())
+  conversationId String
+  sender         String   // customer | ai | agent
+  content        String   @db.Text
+  createdAt      DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@map("messages")
+}
+
+/// Raw log of inbound webhook events. Empty until the Webhooks phase.
+model WebhookLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  source    String   @default("instagram")
+  payload   Json?
+  status    String   @default("received") // received | processed | failed
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@map("webhook_logs")
+}
