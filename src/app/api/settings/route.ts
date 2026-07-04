@@ -36,7 +36,6 @@ export async function POST(request: NextRequest) {
     username: body.username,
     businessAccountId: body.businessAccountId,
     accessToken: body.accessToken,
-    connectionState: "unverified",
   });
 
   return NextResponse.json(updated);

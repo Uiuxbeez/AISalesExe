@@ -32,17 +32,22 @@ model User {
 }
 
 /// Instagram connection details for a business account.
-/// Populated later in the Instagram OAuth phase; UI-only for now.
+/// Phase 2: populated by the real Instagram OAuth (Instagram API with
+/// Instagram Login) flow. `businessAccountId` holds the Instagram-scoped
+/// professional account id (the API's `user_id`), which is also the value
+/// Meta sends as `entry[].id` on incoming webhooks — it's how an inbound
+/// DM gets routed back to the right tenant. It's unique for that reason.
 model InstagramSettings {
-  id                String   @id @default(cuid())
-  userId            String   @unique
+  id                String    @id @default(cuid())
+  userId            String    @unique
   username          String?
-  businessAccountId String?
+  businessAccountId String?   @unique
   accessToken       String?
-  isConnected       Boolean  @default(false)
+  tokenExpiresAt    DateTime?
+  isConnected       Boolean   @default(false)
   lastVerifiedAt    DateTime?
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -68,19 +73,24 @@ model AISettings {
 
 /// A DM thread with a single end customer.
 model Conversation {
-  id              String    @id @default(cuid())
-  userId          String
-  customerName    String
-  customerHandle  String?
-  customerAvatar  String?
-  lastMessageAt   DateTime?
-  status          String    @default("open") // open | pending | closed
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  id                String    @id @default(cuid())
+  userId            String
+  customerName      String
+  customerHandle    String?
+  customerAvatar    String?
+  /// Instagram-scoped ID (IGSID) of the customer, from the webhook
+  /// `messaging[].sender.id`. Used to find-or-create the conversation
+  /// for an inbound DM without creating duplicate threads.
+  instagramSenderId String?
+  lastMessageAt     DateTime?
+  status            String    @default("open") // open | pending | closed
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
 
   user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   messages Message[]
 
+  @@unique([userId, instagramSenderId])
   @@index([userId])
   @@map("conversations")
 }
