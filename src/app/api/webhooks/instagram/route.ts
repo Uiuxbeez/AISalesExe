@@ -34,15 +34,36 @@ export async function POST(request: NextRequest) {
   const rawBody = await request.text();
   const signature = request.headers.get("x-hub-signature-256");
 
-  if (!verifyInstagramWebhookSignature(rawBody, signature)) {
-    console.warn("Instagram webhook: signature verification failed");
-    return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
-  }
-
-  let payload: InstagramWebhookPayload;
+  // Best-effort parse up front so a signature failure can still be logged
+  // with whatever entry.id is present, instead of vanishing entirely.
+  let payload: InstagramWebhookPayload | null = null;
   try {
     payload = JSON.parse(rawBody);
   } catch {
+    payload = null;
+  }
+
+  if (!verifyInstagramWebhookSignature(rawBody, signature)) {
+    console.warn("Instagram webhook: signature verification failed");
+
+    const firstEntryId = payload?.entry?.[0]?.id ?? null;
+    const routedUserId = firstEntryId ? await findUserIdByIgBusinessAccountId(firstEntryId) : null;
+
+    await prisma.webhookLog.create({
+      data: {
+        userId: routedUserId,
+        source: "instagram",
+        // Never log the signature header itself — it's derived from the
+        // app secret and not something that needs to persist anywhere.
+        payload: (payload as unknown as object) ?? { note: "signature invalid, body was not valid JSON" },
+        status: "signature_failed",
+      },
+    });
+
+    return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
+  }
+
+  if (!payload) {
     return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
   }
 
