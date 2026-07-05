@@ -20,6 +20,7 @@ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSe
   const [settings, setSettings] = useState(initialSettings);
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [isVerifying, setIsVerifying] = useState(false);
+  const [verifyResult, setVerifyResult] = useState<"idle" | "success" | "failed">("idle");
   const [isDisconnecting, setIsDisconnecting] = useState(false);
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -59,6 +60,7 @@ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSe
 
   async function handleVerify() {
     setIsVerifying(true);
+    setVerifyResult("idle");
 
     try {
       const response = await fetch("/api/settings/verify", {
@@ -69,6 +71,9 @@ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSe
 
       const result = (await response.json()) as InstagramSettings;
       setSettings(result);
+      setVerifyResult(result.isConnected ? "success" : "failed");
+    } catch {
+      setVerifyResult("failed");
     } finally {
       setIsVerifying(false);
     }
@@ -201,6 +206,18 @@ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSe
             {isVerifying ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
             {isVerifying ? "Verifying…" : "Verify connection"}
           </Button>
+
+          {verifyResult === "success" && (
+            <span className="flex items-center gap-1.5 text-sm text-success">
+              <CheckCircle2 className="h-4 w-4" />
+              Token confirmed with Instagram
+            </span>
+          )}
+          {verifyResult === "failed" && (
+            <span className="text-sm text-danger">
+              Instagram rejected this token — check it&apos;s correct and try again.
+            </span>
+          )}
 
           <Button type="submit" disabled={saveStatus === "saving"}>
             {saveStatus === "saving" && <Loader2 className="h-4 w-4 animate-spin" />}

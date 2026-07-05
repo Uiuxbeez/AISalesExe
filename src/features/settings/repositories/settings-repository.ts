@@ -66,10 +66,20 @@ export async function saveInstagramSettingsManual(
   return toFeatureShape(row);
 }
 
-export async function markVerified(userId: string, isConnected: boolean): Promise<InstagramSettings> {
+export async function markVerified(
+  userId: string,
+  result: { isConnected: false } | { isConnected: true; username: string; businessAccountId: string }
+): Promise<InstagramSettings> {
   const row = await prisma.instagramSettings.update({
     where: { userId },
-    data: { isConnected, lastVerifiedAt: isConnected ? new Date() : null },
+    data: result.isConnected
+      ? {
+          isConnected: true,
+          lastVerifiedAt: new Date(),
+          username: result.username,
+          businessAccountId: result.businessAccountId,
+        }
+      : { isConnected: false, lastVerifiedAt: null },
   });
 
   return toFeatureShape(row);
@@ -102,6 +112,19 @@ export async function saveInstagramSettingsFromOAuth(
   });
 
   return toFeatureShape(row);
+}
+
+/**
+ * Returns the real, unmasked access token for a user — for server-side use
+ * only (e.g. actually calling Meta's API to verify a connection). Never
+ * expose this value to the client.
+ */
+export async function getRawAccessToken(userId: string): Promise<string | null> {
+  const row = await prisma.instagramSettings.findUnique({
+    where: { userId },
+    select: { accessToken: true },
+  });
+  return row?.accessToken ?? null;
 }
 
 /**

@@ -1,5 +1,6 @@
 import {
   getInstagramSettings,
+  getRawAccessToken,
   saveInstagramSettingsManual,
   markVerified,
 } from "@/features/settings/repositories/settings-repository";
@@ -9,6 +10,7 @@ import {
   type InstagramSettings,
 } from "@/features/settings/types";
 import { getCurrentUser } from "@/lib/auth/current-user";
+import { fetchInstagramProfile } from "@/lib/instagram/oauth";
 
 type ManualFields = Pick<InstagramSettings, "username" | "businessAccountId" | "accessToken">;
 type ResolvedManualFields = Pick<InstagramSettings, "username" | "businessAccountId"> & {
@@ -47,9 +49,10 @@ export async function updateInstagramSettings(settings: ManualFields): Promise<I
 }
 
 /**
- * Manual-entry verification: since Phase 2's real connection now happens
- * through OAuth (see /api/auth/instagram/connect), this just checks the
- * hand-typed fields are non-empty, same as Phase 1. It does not call Meta.
+ * Actually verifies the connection against Meta's API — calls
+ * graph.instagram.com/me with the stored/typed token and checks it's a
+ * real, live token. This does NOT just check that the fields are
+ * non-empty; a wrong or fake token will now correctly report as failed.
  */
 export async function verifyInstagramConnection(settings: ManualFields): Promise<InstagramSettings> {
   const user = await getCurrentUser();
@@ -58,10 +61,27 @@ export async function verifyInstagramConnection(settings: ManualFields): Promise
   const current = await getInstagramSettings(user.id);
   const resolved = resolveManualFields(current, settings);
 
-  const hasAllFields = Boolean(
-    resolved.username.trim() && resolved.businessAccountId.trim() && (resolved.accessToken ?? current.accessToken).trim()
-  );
-
+  // Persist whatever was typed first (username/business id, and the token
+  // if a new one was actually entered), so the attempt is visible even if
+  // verification below fails.
   await saveInstagramSettingsManual(user.id, resolved);
-  return markVerified(user.id, hasAllFields);
+
+  const tokenToTest = resolved.accessToken ?? (await getRawAccessToken(user.id));
+
+  if (!tokenToTest) {
+    return markVerified(user.id, { isConnected: false });
+  }
+
+  try {
+    const profile = await fetchInstagramProfile(tokenToTest);
+    // Use the real profile Meta returns rather than trusting whatever the
+    // user typed into the username/business ID fields.
+    return markVerified(user.id, {
+      isConnected: true,
+      username: profile.username,
+      businessAccountId: profile.userId,
+    });
+  } catch {
+    return markVerified(user.id, { isConnected: false });
+  }
 }
