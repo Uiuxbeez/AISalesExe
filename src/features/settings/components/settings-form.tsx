@@ -25,17 +25,21 @@ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSe
   const router = useRouter();
   const searchParams = useSearchParams();
 
-  const oauthError = searchParams.get("instagram_error");
-  const oauthConnected = searchParams.get("instagram_connected");
+  const [oauthError] = useState(() => searchParams.get("instagram_error"));
+  const [oauthConnected] = useState(() => searchParams.get("instagram_connected"));
   const [grantedScopes] = useState(() => searchParams.get("granted_scopes"));
 
   useEffect(() => {
     if (oauthConnected || oauthError) {
-      // Clear the query params after reading them so a refresh doesn't
-      // keep re-showing the banner.
+      // Clear the query params from the URL bar so a refresh doesn't
+      // re-trigger anything — the banner itself keeps showing from the
+      // snapshotted state above, independent of the URL.
       router.replace("/settings");
     }
-  }, [oauthConnected, oauthError, router]);
+    // Intentionally only runs once on mount — oauthConnected/oauthError are
+    // themselves frozen snapshots, not live values, so they can't change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function handleSave(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
