@@ -1,22 +1,44 @@
+import { prisma } from "@/lib/db/prisma";
 import type { DashboardStats } from "@/features/dashboard/types";
+import { formatRelativeLabel } from "@/lib/format-time";
 
 /**
- * Stands in for the future database-backed repository. Once Instagram,
- * AI, and webhook data are real, this is the only file that needs to
- * change — swap the mock object for Prisma queries.
+ * Phase 2: Instagram/webhook status and conversation counts are now real,
+ * pulled from the same instagram_settings/conversations/messages tables the
+ * Settings and Inbox pages use. AI Brain remains genuinely unbuilt (Phase
+ * 3+), so its status is still a fixed "inactive" rather than a fake mock
+ * value pretending otherwise.
  */
-export async function getDashboardStats(): Promise<DashboardStats> {
+export async function getDashboardStats(userId: string): Promise<DashboardStats> {
+  const [instagramSettings, conversationCount, recentMessages] = await Promise.all([
+    prisma.instagramSettings.findUnique({ where: { userId } }),
+    prisma.conversation.count({ where: { userId } }),
+    prisma.message.findMany({
+      where: { conversation: { userId } },
+      orderBy: { createdAt: "desc" },
+      take: 5,
+      include: { conversation: { select: { customerName: true } } },
+    }),
+  ]);
+
+  const isConnected = instagramSettings?.isConnected ?? false;
+  type RecentMessage = (typeof recentMessages)[number];
+
   return {
-    instagramStatus: "disconnected",
+    instagramStatus: isConnected ? "connected" : "disconnected",
     aiStatus: "inactive",
-    webhookStatus: "offline",
-    conversationCount: 128,
-    latestActivity: [
-      { id: "1", message: "New conversation started with @jane.doe", timestamp: "2 minutes ago" },
-      { id: "2", message: "AI Brain settings updated", timestamp: "1 hour ago" },
-      { id: "3", message: "Conversation with @mark.retail marked as closed", timestamp: "3 hours ago" },
-      { id: "4", message: "New conversation started with @lucy.shops", timestamp: "Yesterday" },
-      { id: "5", message: "Instagram connection check failed", timestamp: "Yesterday" },
-    ],
+    // Mirrors the Instagram connection rather than message throughput —
+    // this reflects whether the receiving pipeline is active for this
+    // account, not how recently a customer has messaged.
+    webhookStatus: isConnected ? "live" : "offline",
+    conversationCount,
+    latestActivity: recentMessages.map((message: RecentMessage) => ({
+      id: message.id,
+      message:
+        message.sender === "customer"
+          ? `New message from ${message.conversation.customerName}`
+          : `Message sent to ${message.conversation.customerName}`,
+      timestamp: formatRelativeLabel(message.createdAt),
+    })),
   };
 }
