@@ -36,7 +36,7 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const { accessToken: shortLivedToken } = await exchangeCodeForShortLivedToken(code);
+    const { accessToken: shortLivedToken, grantedPermissions } = await exchangeCodeForShortLivedToken(code);
     const { accessToken: longLivedToken, expiresInSeconds } = await exchangeForLongLivedToken(shortLivedToken);
     const profile = await fetchInstagramProfile(longLivedToken);
 
@@ -47,7 +47,10 @@ export async function GET(request: NextRequest) {
       tokenExpiresAt: new Date(Date.now() + expiresInSeconds * 1000),
     });
 
-    const response = settingsRedirect(request, { instagram_connected: "1" });
+    const response = settingsRedirect(request, {
+      instagram_connected: "1",
+      granted_scopes: grantedPermissions.join(","),
+    });
     response.cookies.delete(OAUTH_STATE_COOKIE_NAME);
     return response;
   } catch (err) {

@@ -18,15 +18,27 @@ export function buildInstagramAuthorizationUrl(state: string): string {
 }
 
 type ShortLivedTokenResponse = {
-  data?: Array<{ access_token: string; user_id: string; permissions?: string[] }>;
+  data?: Array<{ access_token: string; user_id: string; permissions?: string | string[] }>;
   access_token?: string;
   user_id?: string;
+  permissions?: string | string[];
 };
 
-/** Step 2: exchange the ?code= from the callback for a short-lived token. */
+function normalizePermissions(permissions: string | string[] | undefined): string[] {
+  if (!permissions) return [];
+  return Array.isArray(permissions) ? permissions : permissions.split(",").map((p) => p.trim());
+}
+
+/**
+ * Step 2: exchange the ?code= from the callback for a short-lived token.
+ *
+ * Also returns the `permissions` list straight from Meta's response — this
+ * is the actual, first-party record of which scopes were granted, as
+ * opposed to which scopes we merely requested in the authorize URL.
+ */
 export async function exchangeCodeForShortLivedToken(
   code: string
-): Promise<{ accessToken: string; userId: string }> {
+): Promise<{ accessToken: string; userId: string; grantedPermissions: string[] }> {
   const body = new URLSearchParams({
     client_id: instagramConfig.appId,
     client_secret: instagramConfig.appSecret,
@@ -54,7 +66,11 @@ export async function exchangeCodeForShortLivedToken(
     throw new Error(`Instagram token exchange returned an unexpected shape: ${JSON.stringify(json)}`);
   }
 
-  return { accessToken: entry.access_token, userId: String(entry.user_id) };
+  const grantedPermissions = normalizePermissions(entry.permissions);
+  // Visible in Vercel's function logs regardless of what the UI shows.
+  console.log("Instagram OAuth granted permissions:", grantedPermissions);
+
+  return { accessToken: entry.access_token, userId: String(entry.user_id), grantedPermissions };
 }
 
 /** Step 3: trade the short-lived token for a 60-day long-lived token. */

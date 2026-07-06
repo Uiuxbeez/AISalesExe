@@ -27,6 +27,7 @@ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSe
 
   const oauthError = searchParams.get("instagram_error");
   const oauthConnected = searchParams.get("instagram_connected");
+  const [grantedScopes] = useState(() => searchParams.get("granted_scopes"));
 
   useEffect(() => {
     if (oauthConnected || oauthError) {
@@ -93,9 +94,16 @@ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSe
   return (
     <div className="flex max-w-2xl flex-col gap-6">
       {oauthConnected && (
-        <div className="flex items-center gap-2 rounded-md border border-success/30 bg-success/10 px-4 py-3 text-sm text-success">
-          <CheckCircle2 className="h-4 w-4" />
-          Instagram account connected. New DMs will now land in your Inbox.
+        <div className="flex flex-col gap-1 rounded-md border border-success/30 bg-success/10 px-4 py-3 text-sm text-success">
+          <span className="flex items-center gap-2">
+            <CheckCircle2 className="h-4 w-4" />
+            Instagram account connected. New DMs will now land in your Inbox.
+          </span>
+          {grantedScopes !== null && (
+            <span className="pl-6 font-mono text-xs text-success/80">
+              Scopes Meta actually granted: {grantedScopes || "(none returned)"}
+            </span>
+          )}
         </div>
       )}
       {oauthError && (
