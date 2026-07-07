@@ -1,9 +1,12 @@
-import { Send } from "lucide-react";
+"use client";
+
+import { useState, type FormEvent } from "react";
+import { Loader2, Send } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { MessageBubble } from "@/features/inbox/components/message-bubble";
-import type { Conversation } from "@/features/inbox/types";
+import type { Conversation, Message } from "@/features/inbox/types";
 
 const STATUS_VARIANT = {
   open: "success",
@@ -11,7 +14,47 @@ const STATUS_VARIANT = {
   closed: "neutral",
 } as const;
 
-export function ChatPanel({ conversation }: { conversation: Conversation }) {
+export function ChatPanel({
+  conversation,
+  onMessageSent,
+}: {
+  conversation: Conversation;
+  onMessageSent: (message: Message) => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const [isSending, setIsSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleSend(event: FormEvent) {
+    event.preventDefault();
+    const text = draft.trim();
+    if (!text || isSending) return;
+
+    setIsSending(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`/api/inbox/conversations/${conversation.id}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || "Failed to send message");
+      }
+
+      onMessageSent(result as Message);
+      setDraft("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to send message");
+    } finally {
+      setIsSending(false);
+    }
+  }
+
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between border-b border-line px-6 py-4">
@@ -30,17 +73,20 @@ export function ChatPanel({ conversation }: { conversation: Conversation }) {
         ))}
       </div>
 
-      <div className="border-t border-line px-6 py-4">
+      <form onSubmit={handleSend} className="border-t border-line px-6 py-4">
         <div className="flex items-center gap-2">
-          <Input placeholder="Messaging isn't connected yet" disabled />
-          <Button size="icon" disabled aria-label="Send message">
-            <Send className="h-4 w-4" />
+          <Input
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder="Type a reply…"
+            disabled={isSending}
+          />
+          <Button type="submit" size="icon" disabled={isSending || !draft.trim()} aria-label="Send message">
+            {isSending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
           </Button>
         </div>
-        <p className="mt-2 text-xs text-muted">
-          Sending replies will be available once Instagram messaging is connected.
-        </p>
-      </div>
+        {error && <p className="mt-2 text-xs text-danger">{error}</p>}
+      </form>
     </div>
   );
 }

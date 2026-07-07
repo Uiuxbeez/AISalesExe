@@ -1,7 +1,7 @@
-import { getConversationsForUser } from "@/features/inbox/repositories/inbox-repository";
+import { getConversationsForUser, sendReplyToConversation } from "@/features/inbox/repositories/inbox-repository";
 import { getCurrentUser } from "@/lib/auth/current-user";
 import { formatClockTime, formatRelativeLabel } from "@/lib/format-time";
-import type { Conversation, ConversationStatus, MessageSender } from "@/features/inbox/types";
+import type { Conversation, ConversationStatus, Message, MessageSender } from "@/features/inbox/types";
 
 type ConversationRow = Awaited<ReturnType<typeof getConversationsForUser>>[number];
 type MessageRow = ConversationRow["messages"][number];
@@ -38,4 +38,22 @@ export async function fetchConversations(): Promise<Conversation[]> {
       })),
     };
   });
+}
+
+/** Sends a manual reply from the current user's connected Instagram account. Throws on failure. */
+export async function sendReply(conversationId: string, text: string): Promise<Message> {
+  const user = await getCurrentUser();
+  if (!user) throw new Error("Not authenticated");
+
+  const trimmed = text.trim();
+  if (!trimmed) throw new Error("Message can't be empty");
+
+  const message = await sendReplyToConversation(user.id, conversationId, trimmed);
+
+  return {
+    id: message.id,
+    sender: message.sender as MessageSender,
+    content: message.content,
+    timestamp: formatClockTime(message.createdAt),
+  };
 }

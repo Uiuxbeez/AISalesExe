@@ -113,3 +113,60 @@ export async function fetchInstagramProfile(
 
   return { userId: String(json.user_id), username: json.username };
 }
+
+/**
+ * Fetches a message sender's profile (name/username) by their
+ * Instagram-scoped ID (IGSID). Used to replace the "Instagram user
+ * xxxxxx" placeholder with a real name once available. Best-effort:
+ * callers should treat a failure here as non-fatal, since not every
+ * IGSID is guaranteed to return a username (e.g. privacy settings).
+ */
+export async function fetchInstagramSenderProfile(
+  igsid: string,
+  accessToken: string
+): Promise<{ name: string | null; username: string | null }> {
+  const url = new URL(`${INSTAGRAM_GRAPH_URL}/${igsid}`);
+  url.searchParams.set("fields", "name,username");
+  url.searchParams.set("access_token", accessToken);
+
+  const response = await fetch(url.toString());
+  const json = (await response.json().catch(() => null)) as { name?: string; username?: string } | null;
+
+  if (!response.ok || !json) {
+    throw new Error(`Fetching sender profile failed: ${response.status} ${JSON.stringify(json)}`);
+  }
+
+  return { name: json.name ?? null, username: json.username ?? null };
+}
+
+/**
+ * Sends a text message to a customer via Instagram's Send API. Requires
+ * the business account's access token; recipientIgsid is the customer's
+ * Instagram-scoped ID captured from an inbound webhook event.
+ */
+export async function sendInstagramMessage(
+  igBusinessAccountId: string,
+  accessToken: string,
+  recipientIgsid: string,
+  text: string
+): Promise<{ messageId: string }> {
+  const url = new URL(`${INSTAGRAM_GRAPH_URL}/${igBusinessAccountId}/messages`);
+  url.searchParams.set("access_token", accessToken);
+
+  const response = await fetch(url.toString(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      recipient: { id: recipientIgsid },
+      message: { text },
+    }),
+  });
+
+  const json = (await response.json().catch(() => null)) as { message_id?: string } | null;
+
+  if (!response.ok || !json?.message_id) {
+    throw new Error(`Instagram send message failed: ${response.status} ${JSON.stringify(json)}`);
+  }
+
+  return { messageId: json.message_id };
+}

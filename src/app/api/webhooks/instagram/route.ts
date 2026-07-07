@@ -3,7 +3,13 @@ import { prisma } from "@/lib/db/prisma";
 import { instagramConfig } from "@/lib/instagram/config";
 import { verifyInstagramWebhookSignature } from "@/lib/instagram/webhook-verify";
 import { parseIncomingMessages, type InstagramWebhookPayload } from "@/lib/instagram/webhook-types";
-import { findUserIdByIgBusinessAccountId } from "@/features/settings/repositories/settings-repository";
+import {
+  findUserIdByIgBusinessAccountId,
+  getRawAccessToken,
+} from "@/features/settings/repositories/settings-repository";
+import { fetchInstagramSenderProfile } from "@/lib/instagram/oauth";
+
+const PLACEHOLDER_NAME_PREFIX = "Instagram user ";
 
 /**
  * Meta's one-time verification handshake, run when you subscribe this URL
@@ -101,10 +107,10 @@ export async function POST(request: NextRequest) {
       create: {
         userId,
         instagramSenderId: message.senderIgsid,
-        // Real name/username lookup via the Graph API is a nice-to-have,
-        // deferred for now — the IGSID keeps threads correctly separated
-        // even with a placeholder label.
-        customerName: `Instagram user ${message.senderIgsid.slice(-6)}`,
+        // Placeholder until the profile lookup below (best-effort) fills
+        // in a real name — kept distinct enough to detect and retry later
+        // if that lookup fails here.
+        customerName: `${PLACEHOLDER_NAME_PREFIX}${message.senderIgsid.slice(-6)}`,
         customerHandle: null,
         lastMessageAt: message.createdAt,
         status: "open",
@@ -114,6 +120,30 @@ export async function POST(request: NextRequest) {
         status: "open",
       },
     });
+
+    // Best-effort real-name lookup. Only attempted while the conversation
+    // still has a placeholder name, so it self-heals on a later message if
+    // it failed before (e.g. transient error) without needing a separate
+    // backfill script. Never blocks message processing if it fails.
+    if (conversation.customerName.startsWith(PLACEHOLDER_NAME_PREFIX)) {
+      try {
+        const accessToken = await getRawAccessToken(userId);
+        if (accessToken) {
+          const profile = await fetchInstagramSenderProfile(message.senderIgsid, accessToken);
+          if (profile.username || profile.name) {
+            await prisma.conversation.update({
+              where: { id: conversation.id },
+              data: {
+                customerName: profile.name ?? profile.username ?? conversation.customerName,
+                customerHandle: profile.username ? `@${profile.username}` : null,
+              },
+            });
+          }
+        }
+      } catch (err) {
+        console.warn(`Instagram webhook: couldn't fetch sender profile for ${message.senderIgsid}:`, err);
+      }
+    }
 
     await prisma.message.create({
       data: {

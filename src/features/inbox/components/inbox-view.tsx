@@ -4,10 +4,11 @@ import { useMemo, useState } from "react";
 import { Search } from "lucide-react";
 import { ConversationListItem } from "@/features/inbox/components/conversation-list-item";
 import { ChatPanel } from "@/features/inbox/components/chat-panel";
-import type { Conversation } from "@/features/inbox/types";
+import type { Conversation, Message } from "@/features/inbox/types";
 
-export function InboxView({ conversations }: { conversations: Conversation[] }) {
-  const [selectedId, setSelectedId] = useState(conversations[0]?.id);
+export function InboxView({ conversations: initialConversations }: { conversations: Conversation[] }) {
+  const [conversations, setConversations] = useState(initialConversations);
+  const [selectedId, setSelectedId] = useState(initialConversations[0]?.id);
   const [query, setQuery] = useState("");
 
   const filteredConversations = useMemo(() => {
@@ -21,6 +22,21 @@ export function InboxView({ conversations }: { conversations: Conversation[] }) 
   }, [conversations, query]);
 
   const selectedConversation = conversations.find((c) => c.id === selectedId);
+
+  function handleMessageSent(conversationId: string, message: Message) {
+    setConversations((current) =>
+      current.map((conversation) =>
+        conversation.id === conversationId
+          ? {
+              ...conversation,
+              messages: [...conversation.messages, message],
+              lastMessagePreview: message.content,
+              lastMessageAt: "now",
+            }
+          : conversation
+      )
+    );
+  }
 
   return (
     <div className="flex h-[calc(100vh-8.5rem)] overflow-hidden rounded-lg border border-line bg-surface">
@@ -55,7 +71,11 @@ export function InboxView({ conversations }: { conversations: Conversation[] }) 
 
       <div className="flex-1">
         {selectedConversation ? (
-          <ChatPanel conversation={selectedConversation} />
+          <ChatPanel
+            key={selectedConversation.id}
+            conversation={selectedConversation}
+            onMessageSent={(message) => handleMessageSent(selectedConversation.id, message)}
+          />
         ) : (
           <div className="flex h-full items-center justify-center text-sm text-muted">
             Select a conversation to view it here.
