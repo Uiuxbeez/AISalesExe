@@ -1,0 +1,96 @@
+From 8533f1951aee837949b96f8ddc3bb651a7dfd683 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.local>
+Date: Mon, 6 Jul 2026 11:15:33 +0000
+Subject: [PATCH] Add diagnostic route to test the conversations-list endpoint
+
+Meta's docs for the Instagram-Login (Page-less) messaging flow this
+app uses say IGSIDs are 'received from an Instagram messaging webhook
+notification', implying conversation history may only be available
+via webhook push, not a list/pull endpoint the way the older
+Facebook-Page-linked Graph API supports. Rather than guess, this adds
+a login-gated /api/debug/instagram-conversations route that calls
+GET /{ig-user-id}/conversations with the real stored token and
+returns Meta's raw response, so we get a first-party answer on
+whether historical backfill is even possible under this auth flow.
+---
+ .../debug/instagram-conversations/route.ts    | 37 +++++++++++++++++++
+ src/lib/instagram/conversations.ts            | 23 ++++++++++++
+ 2 files changed, 60 insertions(+)
+ create mode 100644 src/app/api/debug/instagram-conversations/route.ts
+ create mode 100644 src/lib/instagram/conversations.ts
+
+diff --git a/src/app/api/debug/instagram-conversations/route.ts b/src/app/api/debug/instagram-conversations/route.ts
+new file mode 100644
+index 0000000..b2ad6f0
+--- /dev/null
++++ b/src/app/api/debug/instagram-conversations/route.ts
+@@ -0,0 +1,37 @@
++import { NextResponse } from "next/server";
++import { getCurrentUser } from "@/lib/auth/current-user";
++import { getInstagramSettings, getRawAccessToken } from "@/features/settings/repositories/settings-repository";
++import { fetchInstagramConversationsRaw } from "@/lib/instagram/conversations";
++
++/**
++ * Diagnostic-only route: calls Meta's conversations-list endpoint with the
++ * real stored token and returns Meta's raw response verbatim. Gated behind
++ * login since it touches a real access token server-side (the token itself
++ * is never returned to the client).
++ */
++export async function GET() {
++  const user = await getCurrentUser();
++  if (!user) {
++    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
++  }
++
++  const settings = await getInstagramSettings(user.id);
++  if (!settings.isConnected || !settings.businessAccountId) {
++    return NextResponse.json({ error: "Instagram is not connected" }, { status: 400 });
++  }
++
++  const accessToken = await getRawAccessToken(user.id);
++  if (!accessToken) {
++    return NextResponse.json({ error: "No access token stored" }, { status: 400 });
++  }
++
++  try {
++    const result = await fetchInstagramConversationsRaw(settings.businessAccountId, accessToken);
++    return NextResponse.json(result);
++  } catch (err) {
++    return NextResponse.json(
++      { error: "Request to Meta failed", detail: err instanceof Error ? err.message : String(err) },
++      { status: 500 }
++    );
++  }
++}
+diff --git a/src/lib/instagram/conversations.ts b/src/lib/instagram/conversations.ts
+new file mode 100644
+index 0000000..f1482e9
+--- /dev/null
++++ b/src/lib/instagram/conversations.ts
+@@ -0,0 +1,23 @@
++import { INSTAGRAM_GRAPH_URL } from "@/lib/instagram/config";
++
++/**
++ * Diagnostic-only: attempts to fetch the list of existing conversations
++ * for an Instagram professional account via the Graph API. This endpoint
++ * is well-documented for the Facebook-Page-linked Graph API, but its
++ * availability for the (Page-less) "Instagram API with Instagram Login"
++ * flow this app uses is not clearly confirmed in Meta's docs — this
++ * function exists purely to get a real, first-party answer instead of
++ * guessing from documentation.
++ */
++export async function fetchInstagramConversationsRaw(
++  igUserId: string,
++  accessToken: string
++): Promise<{ status: number; ok: boolean; body: unknown }> {
++  const url = new URL(`${INSTAGRAM_GRAPH_URL}/${igUserId}/conversations`);
++  url.searchParams.set("access_token", accessToken);
++
++  const response = await fetch(url.toString());
++  const body = await response.json().catch(() => null);
++
++  return { status: response.status, ok: response.ok, body };
++}
+-- 
+2.43.0
+

@@ -1,0 +1,184 @@
+From bcfa66f4a1fb196d19002a51c9ca5cecbf03d5a2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.local>
+Date: Sun, 5 Jul 2026 14:16:06 +0000
+Subject: [PATCH] Make 'Verify connection' actually verify against Meta
+
+Previously this only checked that username/business ID/token fields
+were non-empty and would happily report success on completely fake
+input - a real bug, not just a documentation gap. It now calls
+graph.instagram.com/me with the token and only reports connected if
+Meta accepts it, overwriting username/business ID with whatever Meta
+actually returns (rather than trusting typed values). The settings
+form also now shows an explicit pass/fail message instead of only
+relying on the connected badge.
+---
+ .../settings/components/settings-form.tsx     | 17 +++++++++
+ .../repositories/settings-repository.ts       | 27 ++++++++++++--
+ .../settings/services/settings-service.ts     | 36 ++++++++++++++-----
+ 3 files changed, 70 insertions(+), 10 deletions(-)
+
+diff --git a/src/features/settings/components/settings-form.tsx b/src/features/settings/components/settings-form.tsx
+index 847aecf..de6c4cc 100644
+--- a/src/features/settings/components/settings-form.tsx
++++ b/src/features/settings/components/settings-form.tsx
+@@ -20,6 +20,7 @@ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSe
+   const [settings, setSettings] = useState(initialSettings);
+   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+   const [isVerifying, setIsVerifying] = useState(false);
++  const [verifyResult, setVerifyResult] = useState<"idle" | "success" | "failed">("idle");
+   const [isDisconnecting, setIsDisconnecting] = useState(false);
+   const router = useRouter();
+   const searchParams = useSearchParams();
+@@ -59,6 +60,7 @@ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSe
+ 
+   async function handleVerify() {
+     setIsVerifying(true);
++    setVerifyResult("idle");
+ 
+     try {
+       const response = await fetch("/api/settings/verify", {
+@@ -69,6 +71,9 @@ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSe
+ 
+       const result = (await response.json()) as InstagramSettings;
+       setSettings(result);
++      setVerifyResult(result.isConnected ? "success" : "failed");
++    } catch {
++      setVerifyResult("failed");
+     } finally {
+       setIsVerifying(false);
+     }
+@@ -202,6 +207,18 @@ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSe
+             {isVerifying ? "Verifying…" : "Verify connection"}
+           </Button>
+ 
++          {verifyResult === "success" && (
++            <span className="flex items-center gap-1.5 text-sm text-success">
++              <CheckCircle2 className="h-4 w-4" />
++              Token confirmed with Instagram
++            </span>
++          )}
++          {verifyResult === "failed" && (
++            <span className="text-sm text-danger">
++              Instagram rejected this token — check it&apos;s correct and try again.
++            </span>
++          )}
++
+           <Button type="submit" disabled={saveStatus === "saving"}>
+             {saveStatus === "saving" && <Loader2 className="h-4 w-4 animate-spin" />}
+             {saveStatus === "saving" ? "Saving…" : "Save changes"}
+diff --git a/src/features/settings/repositories/settings-repository.ts b/src/features/settings/repositories/settings-repository.ts
+index 84cc4f6..ca25ca5 100644
+--- a/src/features/settings/repositories/settings-repository.ts
++++ b/src/features/settings/repositories/settings-repository.ts
+@@ -66,10 +66,20 @@ export async function saveInstagramSettingsManual(
+   return toFeatureShape(row);
+ }
+ 
+-export async function markVerified(userId: string, isConnected: boolean): Promise<InstagramSettings> {
++export async function markVerified(
++  userId: string,
++  result: { isConnected: false } | { isConnected: true; username: string; businessAccountId: string }
++): Promise<InstagramSettings> {
+   const row = await prisma.instagramSettings.update({
+     where: { userId },
+-    data: { isConnected, lastVerifiedAt: isConnected ? new Date() : null },
++    data: result.isConnected
++      ? {
++          isConnected: true,
++          lastVerifiedAt: new Date(),
++          username: result.username,
++          businessAccountId: result.businessAccountId,
++        }
++      : { isConnected: false, lastVerifiedAt: null },
+   });
+ 
+   return toFeatureShape(row);
+@@ -104,6 +114,19 @@ export async function saveInstagramSettingsFromOAuth(
+   return toFeatureShape(row);
+ }
+ 
++/**
++ * Returns the real, unmasked access token for a user — for server-side use
++ * only (e.g. actually calling Meta's API to verify a connection). Never
++ * expose this value to the client.
++ */
++export async function getRawAccessToken(userId: string): Promise<string | null> {
++  const row = await prisma.instagramSettings.findUnique({
++    where: { userId },
++    select: { accessToken: true },
++  });
++  return row?.accessToken ?? null;
++}
++
+ /**
+  * Routes an inbound webhook to the right tenant: Meta sends the receiving
+  * IG professional account's id as `entry[].id`, which we stored as
+diff --git a/src/features/settings/services/settings-service.ts b/src/features/settings/services/settings-service.ts
+index a4f3517..73d8e05 100644
+--- a/src/features/settings/services/settings-service.ts
++++ b/src/features/settings/services/settings-service.ts
+@@ -1,5 +1,6 @@
+ import {
+   getInstagramSettings,
++  getRawAccessToken,
+   saveInstagramSettingsManual,
+   markVerified,
+ } from "@/features/settings/repositories/settings-repository";
+@@ -9,6 +10,7 @@ import {
+   type InstagramSettings,
+ } from "@/features/settings/types";
+ import { getCurrentUser } from "@/lib/auth/current-user";
++import { fetchInstagramProfile } from "@/lib/instagram/oauth";
+ 
+ type ManualFields = Pick<InstagramSettings, "username" | "businessAccountId" | "accessToken">;
+ type ResolvedManualFields = Pick<InstagramSettings, "username" | "businessAccountId"> & {
+@@ -47,9 +49,10 @@ export async function updateInstagramSettings(settings: ManualFields): Promise<I
+ }
+ 
+ /**
+- * Manual-entry verification: since Phase 2's real connection now happens
+- * through OAuth (see /api/auth/instagram/connect), this just checks the
+- * hand-typed fields are non-empty, same as Phase 1. It does not call Meta.
++ * Actually verifies the connection against Meta's API — calls
++ * graph.instagram.com/me with the stored/typed token and checks it's a
++ * real, live token. This does NOT just check that the fields are
++ * non-empty; a wrong or fake token will now correctly report as failed.
+  */
+ export async function verifyInstagramConnection(settings: ManualFields): Promise<InstagramSettings> {
+   const user = await getCurrentUser();
+@@ -58,10 +61,27 @@ export async function verifyInstagramConnection(settings: ManualFields): Promise
+   const current = await getInstagramSettings(user.id);
+   const resolved = resolveManualFields(current, settings);
+ 
+-  const hasAllFields = Boolean(
+-    resolved.username.trim() && resolved.businessAccountId.trim() && (resolved.accessToken ?? current.accessToken).trim()
+-  );
+-
++  // Persist whatever was typed first (username/business id, and the token
++  // if a new one was actually entered), so the attempt is visible even if
++  // verification below fails.
+   await saveInstagramSettingsManual(user.id, resolved);
+-  return markVerified(user.id, hasAllFields);
++
++  const tokenToTest = resolved.accessToken ?? (await getRawAccessToken(user.id));
++
++  if (!tokenToTest) {
++    return markVerified(user.id, { isConnected: false });
++  }
++
++  try {
++    const profile = await fetchInstagramProfile(tokenToTest);
++    // Use the real profile Meta returns rather than trusting whatever the
++    // user typed into the username/business ID fields.
++    return markVerified(user.id, {
++      isConnected: true,
++      username: profile.username,
++      businessAccountId: profile.userId,
++    });
++  } catch {
++    return markVerified(user.id, { isConnected: false });
++  }
+ }
+-- 
+2.43.0
+

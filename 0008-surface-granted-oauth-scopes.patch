@@ -1,0 +1,126 @@
+From 55ae78c884eb559d963bee0748eb6e3ddc384d74 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.local>
+Date: Mon, 6 Jul 2026 10:23:00 +0000
+Subject: [PATCH] Surface actual granted OAuth scopes as objective evidence
+
+exchangeCodeForShortLivedToken already typed a 'permissions' field on
+Meta's token response but never read or exposed it. This captures it,
+logs it server-side, and shows it on the Settings success banner after
+reconnecting - giving a first-party answer (straight from Meta's own
+API response) to whether instagram_business_manage_messages was
+actually granted, rather than relying on inference from documentation
+or community reports.
+---
+ src/app/api/auth/instagram/callback/route.ts  |  7 ++++--
+ .../settings/components/settings-form.tsx     | 14 ++++++++---
+ src/lib/instagram/oauth.ts                    | 24 +++++++++++++++----
+ 3 files changed, 36 insertions(+), 9 deletions(-)
+
+diff --git a/src/app/api/auth/instagram/callback/route.ts b/src/app/api/auth/instagram/callback/route.ts
+index d9be5a9..3dea517 100644
+--- a/src/app/api/auth/instagram/callback/route.ts
++++ b/src/app/api/auth/instagram/callback/route.ts
+@@ -36,7 +36,7 @@ export async function GET(request: NextRequest) {
+   }
+ 
+   try {
+-    const { accessToken: shortLivedToken } = await exchangeCodeForShortLivedToken(code);
++    const { accessToken: shortLivedToken, grantedPermissions } = await exchangeCodeForShortLivedToken(code);
+     const { accessToken: longLivedToken, expiresInSeconds } = await exchangeForLongLivedToken(shortLivedToken);
+     const profile = await fetchInstagramProfile(longLivedToken);
+ 
+@@ -47,7 +47,10 @@ export async function GET(request: NextRequest) {
+       tokenExpiresAt: new Date(Date.now() + expiresInSeconds * 1000),
+     });
+ 
+-    const response = settingsRedirect(request, { instagram_connected: "1" });
++    const response = settingsRedirect(request, {
++      instagram_connected: "1",
++      granted_scopes: grantedPermissions.join(","),
++    });
+     response.cookies.delete(OAUTH_STATE_COOKIE_NAME);
+     return response;
+   } catch (err) {
+diff --git a/src/features/settings/components/settings-form.tsx b/src/features/settings/components/settings-form.tsx
+index de6c4cc..8387d79 100644
+--- a/src/features/settings/components/settings-form.tsx
++++ b/src/features/settings/components/settings-form.tsx
+@@ -27,6 +27,7 @@ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSe
+ 
+   const oauthError = searchParams.get("instagram_error");
+   const oauthConnected = searchParams.get("instagram_connected");
++  const [grantedScopes] = useState(() => searchParams.get("granted_scopes"));
+ 
+   useEffect(() => {
+     if (oauthConnected || oauthError) {
+@@ -93,9 +94,16 @@ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSe
+   return (
+     <div className="flex max-w-2xl flex-col gap-6">
+       {oauthConnected && (
+-        <div className="flex items-center gap-2 rounded-md border border-success/30 bg-success/10 px-4 py-3 text-sm text-success">
+-          <CheckCircle2 className="h-4 w-4" />
+-          Instagram account connected. New DMs will now land in your Inbox.
++        <div className="flex flex-col gap-1 rounded-md border border-success/30 bg-success/10 px-4 py-3 text-sm text-success">
++          <span className="flex items-center gap-2">
++            <CheckCircle2 className="h-4 w-4" />
++            Instagram account connected. New DMs will now land in your Inbox.
++          </span>
++          {grantedScopes !== null && (
++            <span className="pl-6 font-mono text-xs text-success/80">
++              Scopes Meta actually granted: {grantedScopes || "(none returned)"}
++            </span>
++          )}
+         </div>
+       )}
+       {oauthError && (
+diff --git a/src/lib/instagram/oauth.ts b/src/lib/instagram/oauth.ts
+index 6c46cc4..9e3a121 100644
+--- a/src/lib/instagram/oauth.ts
++++ b/src/lib/instagram/oauth.ts
+@@ -18,15 +18,27 @@ export function buildInstagramAuthorizationUrl(state: string): string {
+ }
+ 
+ type ShortLivedTokenResponse = {
+-  data?: Array<{ access_token: string; user_id: string; permissions?: string[] }>;
++  data?: Array<{ access_token: string; user_id: string; permissions?: string | string[] }>;
+   access_token?: string;
+   user_id?: string;
++  permissions?: string | string[];
+ };
+ 
+-/** Step 2: exchange the ?code= from the callback for a short-lived token. */
++function normalizePermissions(permissions: string | string[] | undefined): string[] {
++  if (!permissions) return [];
++  return Array.isArray(permissions) ? permissions : permissions.split(",").map((p) => p.trim());
++}
++
++/**
++ * Step 2: exchange the ?code= from the callback for a short-lived token.
++ *
++ * Also returns the `permissions` list straight from Meta's response — this
++ * is the actual, first-party record of which scopes were granted, as
++ * opposed to which scopes we merely requested in the authorize URL.
++ */
+ export async function exchangeCodeForShortLivedToken(
+   code: string
+-): Promise<{ accessToken: string; userId: string }> {
++): Promise<{ accessToken: string; userId: string; grantedPermissions: string[] }> {
+   const body = new URLSearchParams({
+     client_id: instagramConfig.appId,
+     client_secret: instagramConfig.appSecret,
+@@ -54,7 +66,11 @@ export async function exchangeCodeForShortLivedToken(
+     throw new Error(`Instagram token exchange returned an unexpected shape: ${JSON.stringify(json)}`);
+   }
+ 
+-  return { accessToken: entry.access_token, userId: String(entry.user_id) };
++  const grantedPermissions = normalizePermissions(entry.permissions);
++  // Visible in Vercel's function logs regardless of what the UI shows.
++  console.log("Instagram OAuth granted permissions:", grantedPermissions);
++
++  return { accessToken: entry.access_token, userId: String(entry.user_id), grantedPermissions };
+ }
+ 
+ /** Step 3: trade the short-lived token for a 60-day long-lived token. */
+-- 
+2.43.0
+

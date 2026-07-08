@@ -1,0 +1,64 @@
+From 0cb491bf6e3ee8bc35ca9145eb36f9c7801ac905 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.local>
+Date: Sat, 4 Jul 2026 13:55:26 +0000
+Subject: [PATCH] Log signature-failed webhook deliveries instead of dropping
+ them
+
+Previously a failed X-Hub-Signature-256 check returned 401 with nothing
+persisted, which made 'zero rows in webhook_logs' ambiguous between
+'Meta never called us' and 'Meta called us but the secret is wrong'.
+Now a signature failure still gets a WebhookLog row (status:
+'signature_failed', payload best-effort parsed, no secret/signature
+data retained) so this is diagnosable from the DB alone.
+---
+ src/app/api/webhooks/instagram/route.ts | 29 +++++++++++++++++++++----
+ 1 file changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/src/app/api/webhooks/instagram/route.ts b/src/app/api/webhooks/instagram/route.ts
+index af7dd72..8139492 100644
+--- a/src/app/api/webhooks/instagram/route.ts
++++ b/src/app/api/webhooks/instagram/route.ts
+@@ -34,15 +34,36 @@ export async function POST(request: NextRequest) {
+   const rawBody = await request.text();
+   const signature = request.headers.get("x-hub-signature-256");
+ 
++  // Best-effort parse up front so a signature failure can still be logged
++  // with whatever entry.id is present, instead of vanishing entirely.
++  let payload: InstagramWebhookPayload | null = null;
++  try {
++    payload = JSON.parse(rawBody);
++  } catch {
++    payload = null;
++  }
++
+   if (!verifyInstagramWebhookSignature(rawBody, signature)) {
+     console.warn("Instagram webhook: signature verification failed");
++
++    const firstEntryId = payload?.entry?.[0]?.id ?? null;
++    const routedUserId = firstEntryId ? await findUserIdByIgBusinessAccountId(firstEntryId) : null;
++
++    await prisma.webhookLog.create({
++      data: {
++        userId: routedUserId,
++        source: "instagram",
++        // Never log the signature header itself — it's derived from the
++        // app secret and not something that needs to persist anywhere.
++        payload: (payload as unknown as object) ?? { note: "signature invalid, body was not valid JSON" },
++        status: "signature_failed",
++      },
++    });
++
+     return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
+   }
+ 
+-  let payload: InstagramWebhookPayload;
+-  try {
+-    payload = JSON.parse(rawBody);
+-  } catch {
++  if (!payload) {
+     return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
+   }
+ 
+-- 
+2.43.0
+

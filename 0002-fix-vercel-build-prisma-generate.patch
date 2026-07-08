@@ -1,0 +1,35 @@
+From 81d6239320753a9f88b62a4d6f0c4b0304d79030 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.local>
+Date: Sat, 4 Jul 2026 06:45:42 +0000
+Subject: [PATCH] Fix Vercel build: force Prisma generate + migrate deploy
+
+Vercel's cached node_modules meant the stale Phase-1 Prisma Client
+(generated before tokenExpiresAt/instagramSenderId existed) was still
+being used at build time, causing a type error in the disconnect
+route. package.json's build script now runs 'prisma generate' before
+'next build' unconditionally, and 'prisma migrate deploy' so the
+production database actually gets the new columns/indexes applied on
+deploy (there's no separate release step on Vercel).
+---
+ package.json | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/package.json b/package.json
+index e0f9062..5b69034 100644
+--- a/package.json
++++ b/package.json
+@@ -4,9 +4,10 @@
+   "private": true,
+   "scripts": {
+     "dev": "next dev",
+-    "build": "next build",
++    "build": "prisma generate && prisma migrate deploy && next build",
+     "start": "next start",
+     "lint": "next lint",
++    "postinstall": "prisma generate",
+     "prisma:generate": "prisma generate",
+     "prisma:migrate": "prisma migrate dev",
+     "prisma:studio": "prisma studio",
+-- 
+2.43.0
+

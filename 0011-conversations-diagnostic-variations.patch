@@ -1,0 +1,62 @@
+From 392354878b6eb26bfed2f82ad7d22acd0e3f049c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.local>
+Date: Mon, 6 Jul 2026 11:21:53 +0000
+Subject: [PATCH] Try multiple query variations on the conversations diagnostic
+
+First attempt returned 200 with an empty data array, which is
+ambiguous between 'genuinely no conversations' and 'missing a
+parameter Meta needs'. Now tries bare, platform=instagram, an
+explicit fields expansion, and both combined, in one request.
+---
+ src/lib/instagram/conversations.ts | 31 ++++++++++++++++++++++++------
+ 1 file changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/src/lib/instagram/conversations.ts b/src/lib/instagram/conversations.ts
+index f1482e9..ae324ab 100644
+--- a/src/lib/instagram/conversations.ts
++++ b/src/lib/instagram/conversations.ts
+@@ -8,16 +8,35 @@ import { INSTAGRAM_GRAPH_URL } from "@/lib/instagram/config";
+  * flow this app uses is not clearly confirmed in Meta's docs — this
+  * function exists purely to get a real, first-party answer instead of
+  * guessing from documentation.
++ *
++ * Tries a few query variations in one shot, since an empty `data: []`
++ * with a 200 status is ambiguous between "genuinely no conversations"
++ * and "missing a parameter Meta needs to actually return results".
+  */
+ export async function fetchInstagramConversationsRaw(
+   igUserId: string,
+   accessToken: string
+-): Promise<{ status: number; ok: boolean; body: unknown }> {
+-  const url = new URL(`${INSTAGRAM_GRAPH_URL}/${igUserId}/conversations`);
+-  url.searchParams.set("access_token", accessToken);
++): Promise<Record<string, { status: number; ok: boolean; body: unknown }>> {
++  async function call(label: string, params: Record<string, string>) {
++    const url = new URL(`${INSTAGRAM_GRAPH_URL}/${igUserId}/conversations`);
++    url.searchParams.set("access_token", accessToken);
++    for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+ 
+-  const response = await fetch(url.toString());
+-  const body = await response.json().catch(() => null);
++    const response = await fetch(url.toString());
++    const body = await response.json().catch(() => null);
++    return [label, { status: response.status, ok: response.ok, body }] as const;
++  }
+ 
+-  return { status: response.status, ok: response.ok, body };
++  const results = await Promise.all([
++    call("bare", {}),
++    call("with_platform", { platform: "instagram" }),
++    call("with_fields", { fields: "participants,updated_time,messages{message,from,to,created_time}" }),
++    call("with_platform_and_fields", {
++      platform: "instagram",
++      fields: "participants,updated_time,messages{message,from,to,created_time}",
++    }),
++  ]);
++
++  return Object.fromEntries(results);
+ }
++
+-- 
+2.43.0
+

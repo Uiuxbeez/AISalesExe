@@ -1,0 +1,445 @@
+From 47bbc383e55060f176383bcdf9a4e891b9da21c8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.local>
+Date: Tue, 7 Jul 2026 08:20:02 +0000
+Subject: [PATCH] Phase 3 (manual): real sender usernames + manual reply
+ sending
+
+- Webhook now fetches the sender's real name/username via Instagram's
+  Graph API on the first message from a new conversation, replacing
+  the 'Instagram user xxxxxx' placeholder. Self-heals on a later
+  message if the initial lookup fails (best-effort, never blocks
+  message processing).
+- New POST /api/inbox/conversations/[id]/messages route sends a
+  reply through Instagram's Send API and persists it as an 'agent'
+  message on success.
+- Chat panel's reply box is now fully wired: type, send, optimistic
+  UI update, inline error display on failure (e.g. Instagram
+  disconnected, empty conversation-sender mapping).
+- Inbox view lifts conversation state up so a sent message updates
+  the list preview and timestamp immediately without a full refetch.
+---
+ .../conversations/[id]/messages/route.ts      | 26 +++++++
+ src/app/api/webhooks/instagram/route.ts       | 40 +++++++++--
+ src/features/inbox/components/chat-panel.tsx  | 68 ++++++++++++++++---
+ src/features/inbox/components/inbox-view.tsx  | 28 ++++++--
+ .../inbox/repositories/inbox-repository.ts    | 50 ++++++++++++++
+ src/features/inbox/services/inbox-service.ts  | 22 +++++-
+ src/lib/instagram/oauth.ts                    | 57 ++++++++++++++++
+ 7 files changed, 269 insertions(+), 22 deletions(-)
+ create mode 100644 src/app/api/inbox/conversations/[id]/messages/route.ts
+
+diff --git a/src/app/api/inbox/conversations/[id]/messages/route.ts b/src/app/api/inbox/conversations/[id]/messages/route.ts
+new file mode 100644
+index 0000000..a2b729d
+--- /dev/null
++++ b/src/app/api/inbox/conversations/[id]/messages/route.ts
+@@ -0,0 +1,26 @@
++import { NextRequest, NextResponse } from "next/server";
++import { getSession } from "@/lib/auth/session";
++import { sendReply } from "@/features/inbox/services/inbox-service";
++
++export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
++  const session = await getSession();
++  if (!session) {
++    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
++  }
++
++  const { id } = await params;
++  const body = await request.json().catch(() => null);
++  const text = typeof body?.text === "string" ? body.text : "";
++
++  if (!text.trim()) {
++    return NextResponse.json({ error: "Message can't be empty" }, { status: 400 });
++  }
++
++  try {
++    const message = await sendReply(id, text);
++    return NextResponse.json(message);
++  } catch (err) {
++    const detail = err instanceof Error ? err.message : "Failed to send message";
++    return NextResponse.json({ error: detail }, { status: 400 });
++  }
++}
+diff --git a/src/app/api/webhooks/instagram/route.ts b/src/app/api/webhooks/instagram/route.ts
+index 8139492..f901054 100644
+--- a/src/app/api/webhooks/instagram/route.ts
++++ b/src/app/api/webhooks/instagram/route.ts
+@@ -3,7 +3,13 @@ import { prisma } from "@/lib/db/prisma";
+ import { instagramConfig } from "@/lib/instagram/config";
+ import { verifyInstagramWebhookSignature } from "@/lib/instagram/webhook-verify";
+ import { parseIncomingMessages, type InstagramWebhookPayload } from "@/lib/instagram/webhook-types";
+-import { findUserIdByIgBusinessAccountId } from "@/features/settings/repositories/settings-repository";
++import {
++  findUserIdByIgBusinessAccountId,
++  getRawAccessToken,
++} from "@/features/settings/repositories/settings-repository";
++import { fetchInstagramSenderProfile } from "@/lib/instagram/oauth";
++
++const PLACEHOLDER_NAME_PREFIX = "Instagram user ";
+ 
+ /**
+  * Meta's one-time verification handshake, run when you subscribe this URL
+@@ -101,10 +107,10 @@ export async function POST(request: NextRequest) {
+       create: {
+         userId,
+         instagramSenderId: message.senderIgsid,
+-        // Real name/username lookup via the Graph API is a nice-to-have,
+-        // deferred for now — the IGSID keeps threads correctly separated
+-        // even with a placeholder label.
+-        customerName: `Instagram user ${message.senderIgsid.slice(-6)}`,
++        // Placeholder until the profile lookup below (best-effort) fills
++        // in a real name — kept distinct enough to detect and retry later
++        // if that lookup fails here.
++        customerName: `${PLACEHOLDER_NAME_PREFIX}${message.senderIgsid.slice(-6)}`,
+         customerHandle: null,
+         lastMessageAt: message.createdAt,
+         status: "open",
+@@ -115,6 +121,30 @@ export async function POST(request: NextRequest) {
+       },
+     });
+ 
++    // Best-effort real-name lookup. Only attempted while the conversation
++    // still has a placeholder name, so it self-heals on a later message if
++    // it failed before (e.g. transient error) without needing a separate
++    // backfill script. Never blocks message processing if it fails.
++    if (conversation.customerName.startsWith(PLACEHOLDER_NAME_PREFIX)) {
++      try {
++        const accessToken = await getRawAccessToken(userId);
++        if (accessToken) {
++          const profile = await fetchInstagramSenderProfile(message.senderIgsid, accessToken);
++          if (profile.username || profile.name) {
++            await prisma.conversation.update({
++              where: { id: conversation.id },
++              data: {
++                customerName: profile.name ?? profile.username ?? conversation.customerName,
++                customerHandle: profile.username ? `@${profile.username}` : null,
++              },
++            });
++          }
++        }
++      } catch (err) {
++        console.warn(`Instagram webhook: couldn't fetch sender profile for ${message.senderIgsid}:`, err);
++      }
++    }
++
+     await prisma.message.create({
+       data: {
+         conversationId: conversation.id,
+diff --git a/src/features/inbox/components/chat-panel.tsx b/src/features/inbox/components/chat-panel.tsx
+index 4ead0de..9ec8931 100644
+--- a/src/features/inbox/components/chat-panel.tsx
++++ b/src/features/inbox/components/chat-panel.tsx
+@@ -1,9 +1,12 @@
+-import { Send } from "lucide-react";
++"use client";
++
++import { useState, type FormEvent } from "react";
++import { Loader2, Send } from "lucide-react";
+ import { Badge } from "@/components/ui/badge";
+ import { Input } from "@/components/ui/input";
+ import { Button } from "@/components/ui/button";
+ import { MessageBubble } from "@/features/inbox/components/message-bubble";
+-import type { Conversation } from "@/features/inbox/types";
++import type { Conversation, Message } from "@/features/inbox/types";
+ 
+ const STATUS_VARIANT = {
+   open: "success",
+@@ -11,7 +14,47 @@ const STATUS_VARIANT = {
+   closed: "neutral",
+ } as const;
+ 
+-export function ChatPanel({ conversation }: { conversation: Conversation }) {
++export function ChatPanel({
++  conversation,
++  onMessageSent,
++}: {
++  conversation: Conversation;
++  onMessageSent: (message: Message) => void;
++}) {
++  const [draft, setDraft] = useState("");
++  const [isSending, setIsSending] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  async function handleSend(event: FormEvent) {
++    event.preventDefault();
++    const text = draft.trim();
++    if (!text || isSending) return;
++
++    setIsSending(true);
++    setError(null);
++
++    try {
++      const response = await fetch(`/api/inbox/conversations/${conversation.id}/messages`, {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ text }),
++      });
++
++      const result = await response.json();
++
++      if (!response.ok) {
++        throw new Error(result.error || "Failed to send message");
++      }
++
++      onMessageSent(result as Message);
++      setDraft("");
++    } catch (err) {
++      setError(err instanceof Error ? err.message : "Failed to send message");
++    } finally {
++      setIsSending(false);
++    }
++  }
++
+   return (
+     <div className="flex h-full flex-col">
+       <div className="flex items-center justify-between border-b border-line px-6 py-4">
+@@ -30,17 +73,20 @@ export function ChatPanel({ conversation }: { conversation: Conversation }) {
+         ))}
+       </div>
+ 
+-      <div className="border-t border-line px-6 py-4">
++      <form onSubmit={handleSend} className="border-t border-line px-6 py-4">
+         <div className="flex items-center gap-2">
+-          <Input placeholder="Messaging isn't connected yet" disabled />
+-          <Button size="icon" disabled aria-label="Send message">
+-            <Send className="h-4 w-4" />
++          <Input
++            value={draft}
++            onChange={(e) => setDraft(e.target.value)}
++            placeholder="Type a reply…"
++            disabled={isSending}
++          />
++          <Button type="submit" size="icon" disabled={isSending || !draft.trim()} aria-label="Send message">
++            {isSending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+           </Button>
+         </div>
+-        <p className="mt-2 text-xs text-muted">
+-          Sending replies will be available once Instagram messaging is connected.
+-        </p>
+-      </div>
++        {error && <p className="mt-2 text-xs text-danger">{error}</p>}
++      </form>
+     </div>
+   );
+ }
+diff --git a/src/features/inbox/components/inbox-view.tsx b/src/features/inbox/components/inbox-view.tsx
+index 6a95911..0a06e6d 100644
+--- a/src/features/inbox/components/inbox-view.tsx
++++ b/src/features/inbox/components/inbox-view.tsx
+@@ -4,10 +4,11 @@ import { useMemo, useState } from "react";
+ import { Search } from "lucide-react";
+ import { ConversationListItem } from "@/features/inbox/components/conversation-list-item";
+ import { ChatPanel } from "@/features/inbox/components/chat-panel";
+-import type { Conversation } from "@/features/inbox/types";
++import type { Conversation, Message } from "@/features/inbox/types";
+ 
+-export function InboxView({ conversations }: { conversations: Conversation[] }) {
+-  const [selectedId, setSelectedId] = useState(conversations[0]?.id);
++export function InboxView({ conversations: initialConversations }: { conversations: Conversation[] }) {
++  const [conversations, setConversations] = useState(initialConversations);
++  const [selectedId, setSelectedId] = useState(initialConversations[0]?.id);
+   const [query, setQuery] = useState("");
+ 
+   const filteredConversations = useMemo(() => {
+@@ -22,6 +23,21 @@ export function InboxView({ conversations }: { conversations: Conversation[] })
+ 
+   const selectedConversation = conversations.find((c) => c.id === selectedId);
+ 
++  function handleMessageSent(conversationId: string, message: Message) {
++    setConversations((current) =>
++      current.map((conversation) =>
++        conversation.id === conversationId
++          ? {
++              ...conversation,
++              messages: [...conversation.messages, message],
++              lastMessagePreview: message.content,
++              lastMessageAt: "now",
++            }
++          : conversation
++      )
++    );
++  }
++
+   return (
+     <div className="flex h-[calc(100vh-8.5rem)] overflow-hidden rounded-lg border border-line bg-surface">
+       <div className="flex w-80 shrink-0 flex-col border-r border-line">
+@@ -55,7 +71,11 @@ export function InboxView({ conversations }: { conversations: Conversation[] })
+ 
+       <div className="flex-1">
+         {selectedConversation ? (
+-          <ChatPanel conversation={selectedConversation} />
++          <ChatPanel
++            key={selectedConversation.id}
++            conversation={selectedConversation}
++            onMessageSent={(message) => handleMessageSent(selectedConversation.id, message)}
++          />
+         ) : (
+           <div className="flex h-full items-center justify-center text-sm text-muted">
+             Select a conversation to view it here.
+diff --git a/src/features/inbox/repositories/inbox-repository.ts b/src/features/inbox/repositories/inbox-repository.ts
+index a7c2614..7ec1375 100644
+--- a/src/features/inbox/repositories/inbox-repository.ts
++++ b/src/features/inbox/repositories/inbox-repository.ts
+@@ -1,4 +1,6 @@
+ import { prisma } from "@/lib/db/prisma";
++import { getRawAccessToken } from "@/features/settings/repositories/settings-repository";
++import { sendInstagramMessage } from "@/lib/instagram/oauth";
+ 
+ export async function getConversationsForUser(userId: string) {
+   return prisma.conversation.findMany({
+@@ -9,3 +11,51 @@ export async function getConversationsForUser(userId: string) {
+     },
+   });
+ }
++
++/**
++ * Sends a reply through Instagram's Send API, then persists it as an
++ * "agent" message on success. Throws if the conversation doesn't belong
++ * to this user, has no Instagram sender to reply to, or if Instagram
++ * isn't connected — callers should surface these as user-facing errors
++ * rather than silently failing.
++ */
++export async function sendReplyToConversation(userId: string, conversationId: string, text: string) {
++  const [conversation, instagramSettings] = await Promise.all([
++    prisma.conversation.findUnique({ where: { id: conversationId } }),
++    prisma.instagramSettings.findUnique({ where: { userId } }),
++  ]);
++
++  if (!conversation || conversation.userId !== userId) {
++    throw new Error("Conversation not found");
++  }
++  if (!conversation.instagramSenderId) {
++    throw new Error("This conversation has no Instagram sender to reply to");
++  }
++  if (!instagramSettings?.isConnected || !instagramSettings.businessAccountId) {
++    throw new Error("Instagram is not connected");
++  }
++
++  const accessToken = await getRawAccessToken(userId);
++  if (!accessToken) {
++    throw new Error("No Instagram access token stored");
++  }
++
++  await sendInstagramMessage(
++    instagramSettings.businessAccountId,
++    accessToken,
++    conversation.instagramSenderId,
++    text
++  );
++
++  const [message] = await prisma.$transaction([
++    prisma.message.create({
++      data: { conversationId, sender: "agent", content: text },
++    }),
++    prisma.conversation.update({
++      where: { id: conversationId },
++      data: { lastMessageAt: new Date() },
++    }),
++  ]);
++
++  return message;
++}
+diff --git a/src/features/inbox/services/inbox-service.ts b/src/features/inbox/services/inbox-service.ts
+index 0f2a5be..993cca8 100644
+--- a/src/features/inbox/services/inbox-service.ts
++++ b/src/features/inbox/services/inbox-service.ts
+@@ -1,7 +1,7 @@
+-import { getConversationsForUser } from "@/features/inbox/repositories/inbox-repository";
++import { getConversationsForUser, sendReplyToConversation } from "@/features/inbox/repositories/inbox-repository";
+ import { getCurrentUser } from "@/lib/auth/current-user";
+ import { formatClockTime, formatRelativeLabel } from "@/lib/format-time";
+-import type { Conversation, ConversationStatus, MessageSender } from "@/features/inbox/types";
++import type { Conversation, ConversationStatus, Message, MessageSender } from "@/features/inbox/types";
+ 
+ type ConversationRow = Awaited<ReturnType<typeof getConversationsForUser>>[number];
+ type MessageRow = ConversationRow["messages"][number];
+@@ -39,3 +39,21 @@ export async function fetchConversations(): Promise<Conversation[]> {
+     };
+   });
+ }
++
++/** Sends a manual reply from the current user's connected Instagram account. Throws on failure. */
++export async function sendReply(conversationId: string, text: string): Promise<Message> {
++  const user = await getCurrentUser();
++  if (!user) throw new Error("Not authenticated");
++
++  const trimmed = text.trim();
++  if (!trimmed) throw new Error("Message can't be empty");
++
++  const message = await sendReplyToConversation(user.id, conversationId, trimmed);
++
++  return {
++    id: message.id,
++    sender: message.sender as MessageSender,
++    content: message.content,
++    timestamp: formatClockTime(message.createdAt),
++  };
++}
+diff --git a/src/lib/instagram/oauth.ts b/src/lib/instagram/oauth.ts
+index 9e3a121..62ffb72 100644
+--- a/src/lib/instagram/oauth.ts
++++ b/src/lib/instagram/oauth.ts
+@@ -113,3 +113,60 @@ export async function fetchInstagramProfile(
+ 
+   return { userId: String(json.user_id), username: json.username };
+ }
++
++/**
++ * Fetches a message sender's profile (name/username) by their
++ * Instagram-scoped ID (IGSID). Used to replace the "Instagram user
++ * xxxxxx" placeholder with a real name once available. Best-effort:
++ * callers should treat a failure here as non-fatal, since not every
++ * IGSID is guaranteed to return a username (e.g. privacy settings).
++ */
++export async function fetchInstagramSenderProfile(
++  igsid: string,
++  accessToken: string
++): Promise<{ name: string | null; username: string | null }> {
++  const url = new URL(`${INSTAGRAM_GRAPH_URL}/${igsid}`);
++  url.searchParams.set("fields", "name,username");
++  url.searchParams.set("access_token", accessToken);
++
++  const response = await fetch(url.toString());
++  const json = (await response.json().catch(() => null)) as { name?: string; username?: string } | null;
++
++  if (!response.ok || !json) {
++    throw new Error(`Fetching sender profile failed: ${response.status} ${JSON.stringify(json)}`);
++  }
++
++  return { name: json.name ?? null, username: json.username ?? null };
++}
++
++/**
++ * Sends a text message to a customer via Instagram's Send API. Requires
++ * the business account's access token; recipientIgsid is the customer's
++ * Instagram-scoped ID captured from an inbound webhook event.
++ */
++export async function sendInstagramMessage(
++  igBusinessAccountId: string,
++  accessToken: string,
++  recipientIgsid: string,
++  text: string
++): Promise<{ messageId: string }> {
++  const url = new URL(`${INSTAGRAM_GRAPH_URL}/${igBusinessAccountId}/messages`);
++  url.searchParams.set("access_token", accessToken);
++
++  const response = await fetch(url.toString(), {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({
++      recipient: { id: recipientIgsid },
++      message: { text },
++    }),
++  });
++
++  const json = (await response.json().catch(() => null)) as { message_id?: string } | null;
++
++  if (!response.ok || !json?.message_id) {
++    throw new Error(`Instagram send message failed: ${response.status} ${JSON.stringify(json)}`);
++  }
++
++  return { messageId: json.message_id };
++}
+-- 
+2.43.0
+

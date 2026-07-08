@@ -1,0 +1,150 @@
+From 2565e16f9835a874163d4355673fcb1752900dd0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.local>
+Date: Mon, 6 Jul 2026 03:56:40 +0000
+Subject: [PATCH] Wire Dashboard Instagram/webhook status and activity to real
+ data
+
+Dashboard was never touched in Phase 2 and was still showing Phase 1's
+static mock data (fake '128 conversations', fake activity items),
+which directly contradicted the real Connected state on Settings -
+confusing and indefensible once Settings/Inbox were real. Instagram
+status, webhook status, and conversation count now come from the same
+tables Settings/Inbox use. Latest activity now reflects real recent
+messages. AI Brain status is left as 'inactive' since that feature
+genuinely isn't built yet (Phase 3+) - that one wasn't a lie.
+---
+ .../dashboard/components/activity-feed.tsx    | 30 ++++++-----
+ .../repositories/dashboard-repository.ts      | 50 +++++++++++++------
+ .../dashboard/services/dashboard-service.ts   | 13 ++++-
+ 3 files changed, 66 insertions(+), 27 deletions(-)
+
+diff --git a/src/features/dashboard/components/activity-feed.tsx b/src/features/dashboard/components/activity-feed.tsx
+index 243268b..c2f9db8 100644
+--- a/src/features/dashboard/components/activity-feed.tsx
++++ b/src/features/dashboard/components/activity-feed.tsx
+@@ -9,18 +9,24 @@ export function ActivityFeed({ items }: { items: ActivityItem[] }) {
+         <CardDescription>What&apos;s happened across your account recently.</CardDescription>
+       </CardHeader>
+       <CardContent>
+-        <ul className="flex flex-col">
+-          {items.map((item, index) => (
+-            <li
+-              key={item.id}
+-              className="flex items-center justify-between gap-4 border-line py-3 first:pt-0 last:pb-0"
+-              style={{ borderTopWidth: index === 0 ? 0 : 1 }}
+-            >
+-              <span className="text-sm text-ink">{item.message}</span>
+-              <span className="shrink-0 text-xs text-muted">{item.timestamp}</span>
+-            </li>
+-          ))}
+-        </ul>
++        {items.length === 0 ? (
++          <p className="py-2 text-sm text-muted">
++            Nothing yet — activity will show up here once messages start coming in.
++          </p>
++        ) : (
++          <ul className="flex flex-col">
++            {items.map((item, index) => (
++              <li
++                key={item.id}
++                className="flex items-center justify-between gap-4 border-line py-3 first:pt-0 last:pb-0"
++                style={{ borderTopWidth: index === 0 ? 0 : 1 }}
++              >
++                <span className="text-sm text-ink">{item.message}</span>
++                <span className="shrink-0 text-xs text-muted">{item.timestamp}</span>
++              </li>
++            ))}
++          </ul>
++        )}
+       </CardContent>
+     </Card>
+   );
+diff --git a/src/features/dashboard/repositories/dashboard-repository.ts b/src/features/dashboard/repositories/dashboard-repository.ts
+index ec3efc1..51de6ac 100644
+--- a/src/features/dashboard/repositories/dashboard-repository.ts
++++ b/src/features/dashboard/repositories/dashboard-repository.ts
+@@ -1,22 +1,44 @@
++import { prisma } from "@/lib/db/prisma";
+ import type { DashboardStats } from "@/features/dashboard/types";
++import { formatRelativeLabel } from "@/lib/format-time";
+ 
+ /**
+- * Stands in for the future database-backed repository. Once Instagram,
+- * AI, and webhook data are real, this is the only file that needs to
+- * change — swap the mock object for Prisma queries.
++ * Phase 2: Instagram/webhook status and conversation counts are now real,
++ * pulled from the same instagram_settings/conversations/messages tables the
++ * Settings and Inbox pages use. AI Brain remains genuinely unbuilt (Phase
++ * 3+), so its status is still a fixed "inactive" rather than a fake mock
++ * value pretending otherwise.
+  */
+-export async function getDashboardStats(): Promise<DashboardStats> {
++export async function getDashboardStats(userId: string): Promise<DashboardStats> {
++  const [instagramSettings, conversationCount, recentMessages] = await Promise.all([
++    prisma.instagramSettings.findUnique({ where: { userId } }),
++    prisma.conversation.count({ where: { userId } }),
++    prisma.message.findMany({
++      where: { conversation: { userId } },
++      orderBy: { createdAt: "desc" },
++      take: 5,
++      include: { conversation: { select: { customerName: true } } },
++    }),
++  ]);
++
++  const isConnected = instagramSettings?.isConnected ?? false;
++  type RecentMessage = (typeof recentMessages)[number];
++
+   return {
+-    instagramStatus: "disconnected",
++    instagramStatus: isConnected ? "connected" : "disconnected",
+     aiStatus: "inactive",
+-    webhookStatus: "offline",
+-    conversationCount: 128,
+-    latestActivity: [
+-      { id: "1", message: "New conversation started with @jane.doe", timestamp: "2 minutes ago" },
+-      { id: "2", message: "AI Brain settings updated", timestamp: "1 hour ago" },
+-      { id: "3", message: "Conversation with @mark.retail marked as closed", timestamp: "3 hours ago" },
+-      { id: "4", message: "New conversation started with @lucy.shops", timestamp: "Yesterday" },
+-      { id: "5", message: "Instagram connection check failed", timestamp: "Yesterday" },
+-    ],
++    // Mirrors the Instagram connection rather than message throughput —
++    // this reflects whether the receiving pipeline is active for this
++    // account, not how recently a customer has messaged.
++    webhookStatus: isConnected ? "live" : "offline",
++    conversationCount,
++    latestActivity: recentMessages.map((message: RecentMessage) => ({
++      id: message.id,
++      message:
++        message.sender === "customer"
++          ? `New message from ${message.conversation.customerName}`
++          : `Message sent to ${message.conversation.customerName}`,
++      timestamp: formatRelativeLabel(message.createdAt),
++    })),
+   };
+ }
+diff --git a/src/features/dashboard/services/dashboard-service.ts b/src/features/dashboard/services/dashboard-service.ts
+index a7cab3d..1faa3ec 100644
+--- a/src/features/dashboard/services/dashboard-service.ts
++++ b/src/features/dashboard/services/dashboard-service.ts
+@@ -1,6 +1,17 @@
+ import { getDashboardStats } from "@/features/dashboard/repositories/dashboard-repository";
+ import type { DashboardStats } from "@/features/dashboard/types";
++import { getCurrentUser } from "@/lib/auth/current-user";
++
++const EMPTY_STATS: DashboardStats = {
++  instagramStatus: "disconnected",
++  aiStatus: "inactive",
++  webhookStatus: "offline",
++  conversationCount: 0,
++  latestActivity: [],
++};
+ 
+ export async function fetchDashboardStats(): Promise<DashboardStats> {
+-  return getDashboardStats();
++  const user = await getCurrentUser();
++  if (!user) return EMPTY_STATS;
++  return getDashboardStats(user.id);
+ }
+-- 
+2.43.0
+

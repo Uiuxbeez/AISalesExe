@@ -1,0 +1,1581 @@
+From 9e759e76e44ad99b29e63b4ad10a21a86d9151ca Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.local>
+Date: Sat, 4 Jul 2026 06:29:43 +0000
+Subject: [PATCH] Phase 2: Instagram OAuth + webhook receiving
+
+- Add Instagram OAuth (Instagram API with Instagram Login): connect,
+  callback, and disconnect routes. Exchanges code -> short-lived ->
+  60-day long-lived token, stores profile + token against the user.
+- Add /api/webhooks/instagram: GET verification handshake, POST
+  signature-verified ingestion of inbound DMs into WebhookLog and
+  Conversation/Message (no AI reply yet, by design).
+- Wire InstagramSettings + Inbox repositories to real Prisma queries,
+  replacing Phase 1 in-memory/mock data.
+- Schema: unique InstagramSettings.businessAccountId (webhook routing
+  key) + tokenExpiresAt; Conversation.instagramSenderId with a
+  (userId, instagramSenderId) unique constraint for find-or-create.
+- Settings UI: real Connect/Disconnect flow, with a guarded manual
+  fallback form that can't accidentally clobber a real OAuth token.
+- README: Meta App Dashboard setup steps + end-to-end test checklist.
+---
+ .env.example                                  |  19 ++
+ README.md                                     | 125 ++++++++--
+ .../migration.sql                             |  15 ++
+ prisma/schema.prisma                          |  42 ++--
+ src/app/(app)/settings/page.tsx               |   7 +-
+ src/app/api/auth/instagram/callback/route.ts  |  57 +++++
+ src/app/api/auth/instagram/connect/route.ts   |  34 +++
+ .../api/auth/instagram/disconnect/route.ts    |  24 ++
+ src/app/api/settings/route.ts                 |   1 -
+ src/app/api/settings/verify/route.ts          |   1 -
+ src/app/api/webhooks/instagram/route.ts       | 110 +++++++++
+ .../inbox/repositories/inbox-repository.ts    |  11 +
+ src/features/inbox/services/inbox-service.ts  |  93 +++----
+ .../settings/components/settings-form.tsx     | 228 ++++++++++++------
+ .../repositories/settings-repository.ts       | 126 ++++++++--
+ .../settings/services/settings-service.ts     |  73 ++++--
+ src/features/settings/types/index.ts          |  20 ++
+ src/lib/auth/current-user.ts                  |  14 ++
+ src/lib/format-time.ts                        |  24 ++
+ src/lib/instagram/config.ts                   |  44 ++++
+ src/lib/instagram/oauth.ts                    |  99 ++++++++
+ src/lib/instagram/webhook-types.ts            |  56 +++++
+ src/lib/instagram/webhook-verify.ts           |  23 ++
+ 23 files changed, 1047 insertions(+), 199 deletions(-)
+ create mode 100644 prisma/migrations/20260704120000_instagram_oauth_and_webhooks/migration.sql
+ create mode 100644 src/app/api/auth/instagram/callback/route.ts
+ create mode 100644 src/app/api/auth/instagram/connect/route.ts
+ create mode 100644 src/app/api/auth/instagram/disconnect/route.ts
+ create mode 100644 src/app/api/webhooks/instagram/route.ts
+ create mode 100644 src/features/inbox/repositories/inbox-repository.ts
+ create mode 100644 src/lib/auth/current-user.ts
+ create mode 100644 src/lib/format-time.ts
+ create mode 100644 src/lib/instagram/config.ts
+ create mode 100644 src/lib/instagram/oauth.ts
+ create mode 100644 src/lib/instagram/webhook-types.ts
+ create mode 100644 src/lib/instagram/webhook-verify.ts
+
+diff --git a/.env.example b/.env.example
+index ad0871c..f3337de 100644
+--- a/.env.example
++++ b/.env.example
+@@ -3,3 +3,22 @@ DATABASE_URL="postgresql://postgres:postgres@localhost:5432/ai_sales_executive?s
+ 
+ # Secret used to sign the dummy-login JWT cookie. Use a long random string in real deployments.
+ JWT_SECRET="dev-only-secret-change-me"
++
++# Public base URL of this app (no trailing slash). Used to build the
++# Instagram OAuth redirect URI.
++NEXT_PUBLIC_APP_URL="http://localhost:3000"
++
++# Meta App credentials — from developers.facebook.com, "Instagram" product,
++# "API setup with Instagram login". App ID/Secret live on the app's
++# Basic Settings page.
++INSTAGRAM_APP_ID=""
++INSTAGRAM_APP_SECRET=""
++
++# Must exactly match one of the "Valid OAuth Redirect URIs" configured on
++# the Instagram product page in the Meta App Dashboard.
++INSTAGRAM_REDIRECT_URI="http://localhost:3000/api/auth/instagram/callback"
++
++# Any random string you choose. Enter the same value in the Meta App
++# Dashboard's Webhooks product when subscribing this app's callback URL,
++# and Meta will echo it back on the verification handshake.
++INSTAGRAM_WEBHOOK_VERIFY_TOKEN="choose-a-random-string"
+diff --git a/README.md b/README.md
+index 4a359b0..63f31ba 100644
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,101 @@
+-# AI Sales Executive — Phase 1: Application Foundation
++# AI Sales Executive
++
++## Phase 2: Instagram OAuth + Webhook Receiving
++
++Phase 2 adds a **real** Instagram connection and a **real** webhook receiver. No AI
++reply yet — the goal of this phase is only to prove that a DM sent to your
++connected Instagram account lands in the Inbox UI, backed by actual database rows
++instead of mock data.
++
++### What's real now
++
++- **Instagram OAuth** (`/api/auth/instagram/connect` → `/api/auth/instagram/callback`),
++  using the "Instagram API with Instagram Login" flow (no Facebook Page required).
++  Exchanges the auth code for a short-lived token, upgrades it to a 60-day
++  long-lived token, fetches the connected username, and stores it all against
++  your user in `instagram_settings`.
++- **Webhook receiver** (`/api/webhooks/instagram`):
++  - `GET` handles Meta's one-time verification handshake.
++  - `POST` verifies the `X-Hub-Signature-256` header against your app secret,
++    logs the raw payload to `webhook_logs`, and — for each real inbound
++    message — finds-or-creates a `Conversation` keyed by the sender's
++    Instagram-scoped ID and appends a `Message`.
++- **Inbox** now reads real `Conversation`/`Message` rows for the logged-in user
++  instead of mock data. It's empty until your first real DM arrives.
++- **Settings** page has a "Connect with Instagram" button that runs the OAuth
++  flow above, plus a manual fallback form for local testing.
++
++### What's still not built (by design)
++
++- No AI-generated replies — messages just land, nothing responds.
++- No outbound sending at all yet (Meta only allows sending after a customer
++  has messaged you first — that's a Phase 3 concern).
++- No customer profile enrichment (name/avatar) — inbound DMs show a
++  placeholder label built from the sender's Instagram-scoped ID.
++- Still single-tenant under the hood (one dummy login), though the schema
++  (`businessAccountId` as the routing key) is already multi-tenant-shaped.
++
++### One-time Meta App setup
++
++1. Go to [developers.facebook.com](https://developers.facebook.com/apps) and
++   create an app (or use your existing one), type "Business".
++2. Add the **Instagram** product → **API setup with Instagram login**.
++3. Under that product's settings, add a **Valid OAuth Redirect URI** matching
++   `INSTAGRAM_REDIRECT_URI` below exactly (e.g.
++   `https://ai-sales-exe.vercel.app/api/auth/instagram/callback` in production,
++   or your ngrok/localhost URL while developing).
++4. Grab the **Instagram App ID** and **App Secret** from the product's Basic
++   Settings.
++5. Under **Webhooks**, subscribe a callback URL of
++   `https://<your-domain>/api/webhooks/instagram` with a verify token you
++   choose (put the same value in `INSTAGRAM_WEBHOOK_VERIFY_TOKEN`), then
++   subscribe the **instagram** object's **messages** field.
++   - Webhooks require a public HTTPS URL — use your Vercel deployment URL, or
++     `ngrok http 3000` while developing locally.
++6. Add an Instagram tester: under **Roles → Instagram testers**, add the
++   Instagram professional account you'll connect, and accept the invite from
++   the Instagram app's own settings.
++7. The app starts in **development mode**, which is fine for testing with
++   accounts you've explicitly added as testers/roles — you don't need App
++   Review to complete this phase.
++
++### Env vars (see `.env.example`)
++
++```
++NEXT_PUBLIC_APP_URL="https://ai-sales-exe.vercel.app"
++INSTAGRAM_APP_ID="..."
++INSTAGRAM_APP_SECRET="..."
++INSTAGRAM_REDIRECT_URI="https://ai-sales-exe.vercel.app/api/auth/instagram/callback"
++INSTAGRAM_WEBHOOK_VERIFY_TOKEN="pick-any-random-string"
++```
++
++### Applying the schema change
++
++This phase adds `tokenExpiresAt` to `instagram_settings`, makes
++`businessAccountId` unique (it's how an inbound webhook is routed to the right
++user), and adds `instagramSenderId` to `conversations`. Apply it with:
++
++```bash
++npx prisma migrate deploy   # or `migrate dev` locally
++npx prisma generate
++```
++
++### Testing it end-to-end
++
++1. Deploy (or tunnel) so `/api/webhooks/instagram` is reachable over HTTPS.
++2. Log in, go to **Settings**, click **Connect with Instagram**, and approve
++   the permissions as your Instagram tester account.
++3. From a *different* Instagram account, send a DM to the connected account.
++4. Check the **Inbox** — a new conversation should appear with the message,
++   with no AI reply sent back.
++5. If nothing shows up, check `webhook_logs` in the database — every delivery
++   Meta sends is logged there, which is the fastest way to tell whether Meta
++   never called your endpoint (check the Webhooks product's delivery log in
++   the App Dashboard) versus it arrived but wasn't parsed as expected.
++
++---
++
++# Phase 1: Application Foundation
+ 
+ This is the foundation phase of AI Sales Executive, a multi-tenant SaaS that will
+ eventually let businesses connect Instagram and have an AI reply to customer DMs.
+@@ -73,22 +170,26 @@ src/
+       ai-brain/
+       settings/
+     api/                   Route handlers (auth, dashboard, inbox, ai-brain, settings)
++      auth/instagram/      OAuth connect/callback/disconnect (Phase 2)
++      webhooks/instagram/  Webhook verification + inbound DM ingestion (Phase 2)
+   components/
+     ui/                    Generic, reusable UI primitives (Button, Card, Input, …)
+     layout/                Sidebar, topbar, nav config, logout button
+   features/                Feature-based modules
+     auth/                  types, services, components
+     dashboard/             types, repositories, services, components
+-    inbox/                 types, services, components
++    inbox/                 types, repositories, services, components
+     ai-brain/              types, repositories, services, components
+     settings/               types, repositories, services, components
+   lib/
+     auth/                  JWT signing/verification, session cookie helpers
+     db/                    Prisma client singleton
++    instagram/             OAuth helpers, webhook signature verification, payload types (Phase 2)
++    format-time.ts         Relative/clock time formatting for the Inbox
+     utils.ts               `cn` class-merging helper
+   middleware.ts            Route protection for the app shell
+ prisma/
+-  schema.prisma            Foundation schema
++  schema.prisma            Schema (Phase 1 foundation + Phase 2 OAuth/webhook fields)
+   seed.ts                  Seeds the dummy account
+ ```
+ 
+@@ -96,28 +197,22 @@ Each feature follows the same layering so future phases can drop in real logic
+ without restructuring:
+ 
+ - **types** — shape of the data
+-- **repositories** — where data comes from (currently mocked / in-memory; will
+-  become Prisma queries)
++- **repositories** — where data comes from (Prisma queries; Instagram settings
++  and Inbox are wired to the real database as of Phase 2)
+ - **services** — business logic that sits between repositories and the UI
+ - **components** — feature-specific UI
+ - **hooks** — feature-specific React hooks (added as needed in later phases)
+ 
+-## What's mocked in this phase
++## What's still mocked
+ 
+ - **Dashboard** KPIs and activity feed — static mock data from `dashboard-repository.ts`.
+-- **Inbox** conversations and messages — static mock data from `inbox-service.ts`; sending
+-  is disabled in the UI.
+ - **AI Brain** settings — saved to an in-memory store via `/api/ai-brain`, not to
+   OpenAI or the database.
+-- **Settings** (Instagram) — saved to an in-memory store via `/api/settings`;
+-  "Verify connection" only checks that fields are filled in, it never calls Meta.
+ 
+-## Intentionally left for Phase 2+
++## Intentionally left for Phase 3+
+ 
+-- Instagram OAuth and the Meta Graph API
+ - Real AI replies (OpenAI or other providers)
+-- Webhook ingestion for incoming DMs
+-- Wiring `AISettings` / `InstagramSettings` / `Conversation` / `Message` /
+-  `WebhookLog` repositories to real Prisma queries
++- Outbound sending (replying to a customer from the Inbox UI)
+ - Multi-tenant support, CRM, workflow builder, team inbox, analytics, billing
+ - WhatsApp / Facebook Messenger channels
++
+diff --git a/prisma/migrations/20260704120000_instagram_oauth_and_webhooks/migration.sql b/prisma/migrations/20260704120000_instagram_oauth_and_webhooks/migration.sql
+new file mode 100644
+index 0000000..e7becf2
+--- /dev/null
++++ b/prisma/migrations/20260704120000_instagram_oauth_and_webhooks/migration.sql
+@@ -0,0 +1,15 @@
++-- Phase 2: Instagram OAuth + webhook receiving
++
++-- AlterTable: instagram_settings gains a token expiry, and businessAccountId
++-- becomes unique so an inbound webhook's entry.id can look up the tenant.
++ALTER TABLE "instagram_settings" ADD COLUMN "tokenExpiresAt" TIMESTAMP(3);
++
++-- AlterTable: conversations gains the Instagram-scoped sender id used to
++-- find-or-create a thread for an inbound DM.
++ALTER TABLE "conversations" ADD COLUMN "instagramSenderId" TEXT;
++
++-- CreateIndex
++CREATE UNIQUE INDEX "instagram_settings_businessAccountId_key" ON "instagram_settings"("businessAccountId");
++
++-- CreateIndex
++CREATE UNIQUE INDEX "conversations_userId_instagramSenderId_key" ON "conversations"("userId", "instagramSenderId");
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 4e21d5b..2c631d3 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -32,17 +32,22 @@ model User {
+ }
+ 
+ /// Instagram connection details for a business account.
+-/// Populated later in the Instagram OAuth phase; UI-only for now.
++/// Phase 2: populated by the real Instagram OAuth (Instagram API with
++/// Instagram Login) flow. `businessAccountId` holds the Instagram-scoped
++/// professional account id (the API's `user_id`), which is also the value
++/// Meta sends as `entry[].id` on incoming webhooks — it's how an inbound
++/// DM gets routed back to the right tenant. It's unique for that reason.
+ model InstagramSettings {
+-  id                String   @id @default(cuid())
+-  userId            String   @unique
++  id                String    @id @default(cuid())
++  userId            String    @unique
+   username          String?
+-  businessAccountId String?
++  businessAccountId String?   @unique
+   accessToken       String?
+-  isConnected       Boolean  @default(false)
++  tokenExpiresAt    DateTime?
++  isConnected       Boolean   @default(false)
+   lastVerifiedAt    DateTime?
+-  createdAt         DateTime @default(now())
+-  updatedAt         DateTime @updatedAt
++  createdAt         DateTime  @default(now())
++  updatedAt         DateTime  @updatedAt
+ 
+   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+ 
+@@ -68,19 +73,24 @@ model AISettings {
+ 
+ /// A DM thread with a single end customer.
+ model Conversation {
+-  id              String    @id @default(cuid())
+-  userId          String
+-  customerName    String
+-  customerHandle  String?
+-  customerAvatar  String?
+-  lastMessageAt   DateTime?
+-  status          String    @default("open") // open | pending | closed
+-  createdAt       DateTime  @default(now())
+-  updatedAt       DateTime  @updatedAt
++  id                String    @id @default(cuid())
++  userId            String
++  customerName      String
++  customerHandle    String?
++  customerAvatar    String?
++  /// Instagram-scoped ID (IGSID) of the customer, from the webhook
++  /// `messaging[].sender.id`. Used to find-or-create the conversation
++  /// for an inbound DM without creating duplicate threads.
++  instagramSenderId String?
++  lastMessageAt     DateTime?
++  status            String    @default("open") // open | pending | closed
++  createdAt         DateTime  @default(now())
++  updatedAt         DateTime  @updatedAt
+ 
+   user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+   messages Message[]
+ 
++  @@unique([userId, instagramSenderId])
+   @@index([userId])
+   @@map("conversations")
+ }
+diff --git a/src/app/(app)/settings/page.tsx b/src/app/(app)/settings/page.tsx
+index aeabd15..83c9946 100644
+--- a/src/app/(app)/settings/page.tsx
++++ b/src/app/(app)/settings/page.tsx
+@@ -1,7 +1,12 @@
++import { Suspense } from "react";
+ import { fetchInstagramSettings } from "@/features/settings/services/settings-service";
+ import { SettingsForm } from "@/features/settings/components/settings-form";
+ 
+ export default async function SettingsPage() {
+   const settings = await fetchInstagramSettings();
+-  return <SettingsForm initialSettings={settings} />;
++  return (
++    <Suspense>
++      <SettingsForm initialSettings={settings} />
++    </Suspense>
++  );
+ }
+diff --git a/src/app/api/auth/instagram/callback/route.ts b/src/app/api/auth/instagram/callback/route.ts
+new file mode 100644
+index 0000000..d9be5a9
+--- /dev/null
++++ b/src/app/api/auth/instagram/callback/route.ts
+@@ -0,0 +1,57 @@
++import { NextRequest, NextResponse } from "next/server";
++import { getCurrentUser } from "@/lib/auth/current-user";
++import {
++  exchangeCodeForShortLivedToken,
++  exchangeForLongLivedToken,
++  fetchInstagramProfile,
++} from "@/lib/instagram/oauth";
++import { saveInstagramSettingsFromOAuth } from "@/features/settings/repositories/settings-repository";
++import { OAUTH_STATE_COOKIE_NAME } from "@/lib/instagram/config";
++
++function settingsRedirect(request: NextRequest, params: Record<string, string>) {
++  const url = new URL("/settings", request.url);
++  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
++  return NextResponse.redirect(url);
++}
++
++export async function GET(request: NextRequest) {
++  const user = await getCurrentUser();
++  if (!user) {
++    return NextResponse.redirect(new URL("/login", request.url));
++  }
++
++  const { searchParams } = request.nextUrl;
++  const error = searchParams.get("error");
++  const code = searchParams.get("code");
++  const state = searchParams.get("state");
++  const expectedState = request.cookies.get(OAUTH_STATE_COOKIE_NAME)?.value;
++
++  // The user denied the permissions dialog.
++  if (error) {
++    return settingsRedirect(request, { instagram_error: "access_denied" });
++  }
++
++  if (!code || !state || !expectedState || state !== expectedState) {
++    return settingsRedirect(request, { instagram_error: "invalid_state" });
++  }
++
++  try {
++    const { accessToken: shortLivedToken } = await exchangeCodeForShortLivedToken(code);
++    const { accessToken: longLivedToken, expiresInSeconds } = await exchangeForLongLivedToken(shortLivedToken);
++    const profile = await fetchInstagramProfile(longLivedToken);
++
++    await saveInstagramSettingsFromOAuth(user.id, {
++      username: profile.username,
++      igUserId: profile.userId,
++      accessToken: longLivedToken,
++      tokenExpiresAt: new Date(Date.now() + expiresInSeconds * 1000),
++    });
++
++    const response = settingsRedirect(request, { instagram_connected: "1" });
++    response.cookies.delete(OAUTH_STATE_COOKIE_NAME);
++    return response;
++  } catch (err) {
++    console.error("Instagram OAuth callback failed:", err);
++    return settingsRedirect(request, { instagram_error: "connection_failed" });
++  }
++}
+diff --git a/src/app/api/auth/instagram/connect/route.ts b/src/app/api/auth/instagram/connect/route.ts
+new file mode 100644
+index 0000000..e4605a4
+--- /dev/null
++++ b/src/app/api/auth/instagram/connect/route.ts
+@@ -0,0 +1,34 @@
++import { randomBytes } from "node:crypto";
++import { NextResponse } from "next/server";
++import { getSession } from "@/lib/auth/session";
++import { buildInstagramAuthorizationUrl } from "@/lib/instagram/oauth";
++import { OAUTH_STATE_COOKIE_NAME } from "@/lib/instagram/config";
++
++/**
++ * Kicks off the Instagram OAuth flow. Requires the user to already be
++ * logged into the app (this connects *their* Instagram account to *their*
++ * dashboard user).
++ */
++export async function GET() {
++  const session = await getSession();
++  if (!session) {
++    return NextResponse.redirect(new URL("/login", process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"));
++  }
++
++  const state = randomBytes(24).toString("hex");
++  const authorizationUrl = buildInstagramAuthorizationUrl(state);
++
++  const response = NextResponse.redirect(authorizationUrl);
++
++  // Short-lived, httpOnly cookie so the callback can confirm this request
++  // round-trip actually originated here (CSRF protection for the OAuth flow).
++  response.cookies.set(OAUTH_STATE_COOKIE_NAME, state, {
++    httpOnly: true,
++    secure: process.env.NODE_ENV === "production",
++    sameSite: "lax",
++    path: "/",
++    maxAge: 60 * 10, // 10 minutes
++  });
++
++  return response;
++}
+diff --git a/src/app/api/auth/instagram/disconnect/route.ts b/src/app/api/auth/instagram/disconnect/route.ts
+new file mode 100644
+index 0000000..265753a
+--- /dev/null
++++ b/src/app/api/auth/instagram/disconnect/route.ts
+@@ -0,0 +1,24 @@
++import { NextResponse } from "next/server";
++import { getCurrentUser } from "@/lib/auth/current-user";
++import { prisma } from "@/lib/db/prisma";
++
++export async function POST() {
++  const user = await getCurrentUser();
++  if (!user) {
++    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
++  }
++
++  await prisma.instagramSettings.updateMany({
++    where: { userId: user.id },
++    data: {
++      accessToken: null,
++      tokenExpiresAt: null,
++      isConnected: false,
++      lastVerifiedAt: null,
++      businessAccountId: null,
++      username: null,
++    },
++  });
++
++  return NextResponse.json({ success: true });
++}
+diff --git a/src/app/api/settings/route.ts b/src/app/api/settings/route.ts
+index 7f0e9b1..7462bbd 100644
+--- a/src/app/api/settings/route.ts
++++ b/src/app/api/settings/route.ts
+@@ -36,7 +36,6 @@ export async function POST(request: NextRequest) {
+     username: body.username,
+     businessAccountId: body.businessAccountId,
+     accessToken: body.accessToken,
+-    connectionState: "unverified",
+   });
+ 
+   return NextResponse.json(updated);
+diff --git a/src/app/api/settings/verify/route.ts b/src/app/api/settings/verify/route.ts
+index 2e7fd56..b77d34b 100644
+--- a/src/app/api/settings/verify/route.ts
++++ b/src/app/api/settings/verify/route.ts
+@@ -23,7 +23,6 @@ export async function POST(request: NextRequest) {
+     username: body.username,
+     businessAccountId: body.businessAccountId,
+     accessToken: body.accessToken,
+-    connectionState: "unverified",
+   });
+ 
+   return NextResponse.json(result);
+diff --git a/src/app/api/webhooks/instagram/route.ts b/src/app/api/webhooks/instagram/route.ts
+new file mode 100644
+index 0000000..af7dd72
+--- /dev/null
++++ b/src/app/api/webhooks/instagram/route.ts
+@@ -0,0 +1,110 @@
++import { NextRequest, NextResponse } from "next/server";
++import { prisma } from "@/lib/db/prisma";
++import { instagramConfig } from "@/lib/instagram/config";
++import { verifyInstagramWebhookSignature } from "@/lib/instagram/webhook-verify";
++import { parseIncomingMessages, type InstagramWebhookPayload } from "@/lib/instagram/webhook-types";
++import { findUserIdByIgBusinessAccountId } from "@/features/settings/repositories/settings-repository";
++
++/**
++ * Meta's one-time verification handshake, run when you subscribe this URL
++ * in the App Dashboard's Webhooks product. Must echo back `hub.challenge`
++ * as plain text if `hub.verify_token` matches ours.
++ * https://developers.facebook.com/docs/graph-api/webhooks/getting-started#verification-requests
++ */
++export async function GET(request: NextRequest) {
++  const { searchParams } = request.nextUrl;
++  const mode = searchParams.get("hub.mode");
++  const token = searchParams.get("hub.verify_token");
++  const challenge = searchParams.get("hub.challenge");
++
++  if (mode === "subscribe" && token === instagramConfig.webhookVerifyToken && challenge) {
++    return new NextResponse(challenge, { status: 200 });
++  }
++
++  return NextResponse.json({ error: "Verification failed" }, { status: 403 });
++}
++
++/**
++ * Inbound DM delivery. No AI reply here by design — Phase 2 only proves
++ * messages land: verify the request really came from Meta, log the raw
++ * payload, and persist each customer message into Conversation/Message so
++ * it shows up in the Inbox UI.
++ */
++export async function POST(request: NextRequest) {
++  const rawBody = await request.text();
++  const signature = request.headers.get("x-hub-signature-256");
++
++  if (!verifyInstagramWebhookSignature(rawBody, signature)) {
++    console.warn("Instagram webhook: signature verification failed");
++    return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
++  }
++
++  let payload: InstagramWebhookPayload;
++  try {
++    payload = JSON.parse(rawBody);
++  } catch {
++    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
++  }
++
++  const incomingMessages = parseIncomingMessages(payload);
++
++  // Log every delivery — including ones with nothing actionable in them
++  // (echoes, read receipts, etc.) — so the pipeline is inspectable while
++  // debugging the connection.
++  const firstEntryId = payload.entry?.[0]?.id ?? null;
++  const routedUserId = firstEntryId ? await findUserIdByIgBusinessAccountId(firstEntryId) : null;
++
++  await prisma.webhookLog.create({
++    data: {
++      userId: routedUserId,
++      source: "instagram",
++      payload: payload as unknown as object,
++      status: incomingMessages.length > 0 ? "received" : "processed",
++    },
++  });
++
++  for (const message of incomingMessages) {
++    const userId = await findUserIdByIgBusinessAccountId(message.igBusinessAccountId);
++
++    if (!userId) {
++      console.warn(
++        `Instagram webhook: no connected user for IG business account ${message.igBusinessAccountId}, dropping message`
++      );
++      continue;
++    }
++
++    const conversation = await prisma.conversation.upsert({
++      where: {
++        userId_instagramSenderId: { userId, instagramSenderId: message.senderIgsid },
++      },
++      create: {
++        userId,
++        instagramSenderId: message.senderIgsid,
++        // Real name/username lookup via the Graph API is a nice-to-have,
++        // deferred for now — the IGSID keeps threads correctly separated
++        // even with a placeholder label.
++        customerName: `Instagram user ${message.senderIgsid.slice(-6)}`,
++        customerHandle: null,
++        lastMessageAt: message.createdAt,
++        status: "open",
++      },
++      update: {
++        lastMessageAt: message.createdAt,
++        status: "open",
++      },
++    });
++
++    await prisma.message.create({
++      data: {
++        conversationId: conversation.id,
++        sender: "customer",
++        content: message.content,
++        createdAt: message.createdAt,
++      },
++    });
++  }
++
++  // Meta requires a fast 200 response regardless of what you did with the
++  // payload, or it will retry (and eventually stop) delivering.
++  return NextResponse.json({ success: true });
++}
+diff --git a/src/features/inbox/repositories/inbox-repository.ts b/src/features/inbox/repositories/inbox-repository.ts
+new file mode 100644
+index 0000000..a7c2614
+--- /dev/null
++++ b/src/features/inbox/repositories/inbox-repository.ts
+@@ -0,0 +1,11 @@
++import { prisma } from "@/lib/db/prisma";
++
++export async function getConversationsForUser(userId: string) {
++  return prisma.conversation.findMany({
++    where: { userId },
++    orderBy: { lastMessageAt: "desc" },
++    include: {
++      messages: { orderBy: { createdAt: "asc" } },
++    },
++  });
++}
+diff --git a/src/features/inbox/services/inbox-service.ts b/src/features/inbox/services/inbox-service.ts
+index a2a12f5..0f2a5be 100644
+--- a/src/features/inbox/services/inbox-service.ts
++++ b/src/features/inbox/services/inbox-service.ts
+@@ -1,64 +1,41 @@
+-import type { Conversation } from "@/features/inbox/types";
++import { getConversationsForUser } from "@/features/inbox/repositories/inbox-repository";
++import { getCurrentUser } from "@/lib/auth/current-user";
++import { formatClockTime, formatRelativeLabel } from "@/lib/format-time";
++import type { Conversation, ConversationStatus, MessageSender } from "@/features/inbox/types";
++
++type ConversationRow = Awaited<ReturnType<typeof getConversationsForUser>>[number];
++type MessageRow = ConversationRow["messages"][number];
+ 
+ /**
+- * Mock conversation data. Phase 2 replaces this with a repository that
+- * reads the Conversation/Message tables via Prisma.
++ * Phase 2: reads real Conversation/Message rows populated by the Instagram
++ * webhook receiver, replacing the Phase 1 mock data. Returns an empty list
++ * until the first DM arrives — that's the expected state right after
++ * connecting Instagram and before anyone has messaged the account.
+  */
+ export async function fetchConversations(): Promise<Conversation[]> {
+-  return [
+-    {
+-      id: "c1",
+-      customerName: "Jane Doe",
+-      customerHandle: "@jane.doe",
+-      lastMessagePreview: "Does this come in a size medium?",
+-      lastMessageAt: "2m",
+-      status: "open",
+-      unreadCount: 2,
+-      messages: [
+-        { id: "m1", sender: "customer", content: "Hi! I saw your post about the linen shirt.", timestamp: "10:02 AM" },
+-        { id: "m2", sender: "ai", content: "Hey Jane! Yes, the linen shirt is one of our favorites. Which color caught your eye?", timestamp: "10:03 AM" },
+-        { id: "m3", sender: "customer", content: "The sage green one. Does this come in a size medium?", timestamp: "10:05 AM" },
+-      ],
+-    },
+-    {
+-      id: "c2",
+-      customerName: "Mark Retail",
+-      customerHandle: "@mark.retail",
+-      lastMessagePreview: "Perfect, thank you for the help!",
+-      lastMessageAt: "3h",
+-      status: "closed",
+-      unreadCount: 0,
+-      messages: [
+-        { id: "m4", sender: "customer", content: "What's your return policy?", timestamp: "7:14 AM" },
+-        { id: "m5", sender: "ai", content: "We offer free returns within 30 days of delivery, no questions asked.", timestamp: "7:15 AM" },
+-        { id: "m6", sender: "customer", content: "Perfect, thank you for the help!", timestamp: "7:16 AM" },
+-      ],
+-    },
+-    {
+-      id: "c3",
+-      customerName: "Lucy Shops",
+-      customerHandle: "@lucy.shops",
+-      lastMessagePreview: "Can I get a discount code?",
+-      lastMessageAt: "1d",
+-      status: "pending",
+-      unreadCount: 1,
+-      messages: [
+-        { id: "m7", sender: "customer", content: "Loved the new collection! Can I get a discount code?", timestamp: "Yesterday" },
+-      ],
+-    },
+-    {
+-      id: "c4",
+-      customerName: "Alex Reyes",
+-      customerHandle: "@alex.reyes",
+-      lastMessagePreview: "Sounds good, I'll place the order now.",
+-      lastMessageAt: "2d",
+-      status: "closed",
++  const user = await getCurrentUser();
++  if (!user) return [];
++
++  const rows = await getConversationsForUser(user.id);
++
++  return rows.map((row: ConversationRow) => {
++    const lastMessage = row.messages[row.messages.length - 1];
++
++    return {
++      id: row.id,
++      customerName: row.customerName,
++      customerHandle: row.customerHandle ?? "",
++      lastMessagePreview: lastMessage?.content ?? "",
++      lastMessageAt: row.lastMessageAt ? formatRelativeLabel(row.lastMessageAt) : formatRelativeLabel(row.createdAt),
++      status: row.status as ConversationStatus,
++      // Read/unread tracking isn't modeled yet — deferred past Phase 2.
+       unreadCount: 0,
+-      messages: [
+-        { id: "m8", sender: "customer", content: "Is the leather bag still in stock?", timestamp: "Monday" },
+-        { id: "m9", sender: "ai", content: "Yes, it is! We have 4 left in stock right now.", timestamp: "Monday" },
+-        { id: "m10", sender: "customer", content: "Sounds good, I'll place the order now.", timestamp: "Monday" },
+-      ],
+-    },
+-  ];
++      messages: row.messages.map((message: MessageRow) => ({
++        id: message.id,
++        sender: message.sender as MessageSender,
++        content: message.content,
++        timestamp: formatClockTime(message.createdAt),
++      })),
++    };
++  });
+ }
+diff --git a/src/features/settings/components/settings-form.tsx b/src/features/settings/components/settings-form.tsx
+index c450b3d..847aecf 100644
+--- a/src/features/settings/components/settings-form.tsx
++++ b/src/features/settings/components/settings-form.tsx
+@@ -1,7 +1,8 @@
+ "use client";
+ 
+-import { useState, type FormEvent } from "react";
+-import { CheckCircle2, Loader2, ShieldCheck } from "lucide-react";
++import { useEffect, useState, type FormEvent } from "react";
++import { useRouter, useSearchParams } from "next/navigation";
++import { CheckCircle2, Instagram, Loader2, ShieldCheck, Unlink } from "lucide-react";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { Label } from "@/components/ui/label";
+@@ -9,10 +10,30 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
+ import { StatusPulse } from "@/components/ui/status-pulse";
+ import type { InstagramSettings } from "@/features/settings/types";
+ 
++const OAUTH_ERROR_MESSAGES: Record<string, string> = {
++  access_denied: "You declined the Instagram permissions request.",
++  invalid_state: "That connection attempt expired or was tampered with. Please try again.",
++  connection_failed: "Instagram didn't accept the connection. Check your app credentials and try again.",
++};
++
+ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSettings }) {
+   const [settings, setSettings] = useState(initialSettings);
+   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+   const [isVerifying, setIsVerifying] = useState(false);
++  const [isDisconnecting, setIsDisconnecting] = useState(false);
++  const router = useRouter();
++  const searchParams = useSearchParams();
++
++  const oauthError = searchParams.get("instagram_error");
++  const oauthConnected = searchParams.get("instagram_connected");
++
++  useEffect(() => {
++    if (oauthConnected || oauthError) {
++      // Clear the query params after reading them so a refresh doesn't
++      // keep re-showing the banner.
++      router.replace("/settings");
++    }
++  }, [oauthConnected, oauthError, router]);
+ 
+   async function handleSave(event: FormEvent<HTMLFormElement>) {
+     event.preventDefault();
+@@ -53,83 +74,150 @@ export function SettingsForm({ initialSettings }: { initialSettings: InstagramSe
+     }
+   }
+ 
++  async function handleDisconnect() {
++    setIsDisconnecting(true);
++
++    try {
++      await fetch("/api/auth/instagram/disconnect", { method: "POST" });
++      router.refresh();
++    } finally {
++      setIsDisconnecting(false);
++    }
++  }
++
+   return (
+-    <form onSubmit={handleSave} className="flex max-w-2xl flex-col gap-6">
++    <div className="flex max-w-2xl flex-col gap-6">
++      {oauthConnected && (
++        <div className="flex items-center gap-2 rounded-md border border-success/30 bg-success/10 px-4 py-3 text-sm text-success">
++          <CheckCircle2 className="h-4 w-4" />
++          Instagram account connected. New DMs will now land in your Inbox.
++        </div>
++      )}
++      {oauthError && (
++        <div className="rounded-md border border-danger/30 bg-danger/10 px-4 py-3 text-sm text-danger">
++          {OAUTH_ERROR_MESSAGES[oauthError] ?? "Something went wrong connecting Instagram."}
++        </div>
++      )}
++
+       <Card>
+         <CardHeader className="flex-row items-center justify-between space-y-0">
+           <div>
+             <CardTitle>Instagram connection</CardTitle>
+-            <CardDescription>Details for the Instagram Business account you want to connect.</CardDescription>
++            <CardDescription>
++              Connect the Instagram professional account you want to receive DMs from.
++            </CardDescription>
+           </div>
+-          {settings.connectionState === "verified" && <StatusPulse status="live" label="Verified" />}
+-          {settings.connectionState === "failed" && <StatusPulse status="offline" label="Verification failed" />}
+-          {settings.connectionState === "unverified" && <StatusPulse status="idle" label="Not verified" />}
++          {settings.isConnected ? (
++            <StatusPulse status="live" label="Connected" />
++          ) : (
++            <StatusPulse status="idle" label="Not connected" />
++          )}
+         </CardHeader>
+-        <CardContent className="flex flex-col gap-5">
+-          <div className="flex flex-col gap-1.5">
+-            <Label htmlFor="username">Instagram username</Label>
+-            <Input
+-              id="username"
+-              placeholder="myshop.official"
+-              value={settings.username}
+-              onChange={(e) => setSettings({ ...settings, username: e.target.value, connectionState: "unverified" })}
+-            />
+-          </div>
+-
+-          <div className="flex flex-col gap-1.5">
+-            <Label htmlFor="businessAccountId">Instagram business ID</Label>
+-            <Input
+-              id="businessAccountId"
+-              placeholder="1784900000000123"
+-              className="font-mono"
+-              value={settings.businessAccountId}
+-              onChange={(e) =>
+-                setSettings({ ...settings, businessAccountId: e.target.value, connectionState: "unverified" })
+-              }
+-            />
+-          </div>
+-
+-          <div className="flex flex-col gap-1.5">
+-            <Label htmlFor="accessToken">Instagram access token</Label>
+-            <Input
+-              id="accessToken"
+-              type="password"
+-              placeholder="IGQ••••••••••••••••••••••••"
+-              className="font-mono"
+-              value={settings.accessToken}
+-              onChange={(e) =>
+-                setSettings({ ...settings, accessToken: e.target.value, connectionState: "unverified" })
+-              }
+-              autoComplete="off"
+-            />
+-            <p className="text-xs text-muted">
+-              This connects your account once Instagram integration ships — nothing is sent to Meta yet.
+-            </p>
+-          </div>
++        <CardContent className="flex flex-col gap-4">
++          {settings.isConnected ? (
++            <div className="flex flex-col gap-4">
++              <div className="flex flex-col gap-1 text-sm">
++                <span className="text-muted">Connected account</span>
++                <span className="font-medium text-ink">@{settings.username || "unknown"}</span>
++                <span className="font-mono text-xs text-muted">{settings.businessAccountId}</span>
++                {settings.lastVerifiedAt && (
++                  <span className="text-xs text-muted">
++                    Connected {new Date(settings.lastVerifiedAt).toLocaleString()}
++                  </span>
++                )}
++              </div>
++              <Button
++                type="button"
++                variant="outline"
++                onClick={handleDisconnect}
++                disabled={isDisconnecting}
++                className="w-fit"
++              >
++                {isDisconnecting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Unlink className="h-4 w-4" />}
++                {isDisconnecting ? "Disconnecting…" : "Disconnect Instagram"}
++              </Button>
++            </div>
++          ) : (
++            <a href="/api/auth/instagram/connect" className="w-fit">
++              <Button type="button" className="w-fit">
++                <Instagram className="h-4 w-4" />
++                Connect with Instagram
++              </Button>
++            </a>
++          )}
+         </CardContent>
+       </Card>
+ 
+-      <div className="flex items-center gap-3">
+-        <Button type="button" variant="outline" onClick={handleVerify} disabled={isVerifying}>
+-          {isVerifying ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+-          {isVerifying ? "Verifying…" : "Verify connection"}
+-        </Button>
+-
+-        <Button type="submit" disabled={saveStatus === "saving"}>
+-          {saveStatus === "saving" && <Loader2 className="h-4 w-4 animate-spin" />}
+-          {saveStatus === "saving" ? "Saving…" : "Save changes"}
+-        </Button>
+-
+-        {saveStatus === "saved" && (
+-          <span className="flex items-center gap-1.5 text-sm text-success">
+-            <CheckCircle2 className="h-4 w-4" />
+-            Saved
+-          </span>
+-        )}
+-        {saveStatus === "error" && (
+-          <span className="text-sm text-danger">Couldn&apos;t save. Please try again.</span>
+-        )}
+-      </div>
+-    </form>
++      <form onSubmit={handleSave} className="flex flex-col gap-6">
++        <Card>
++          <CardHeader>
++            <CardTitle className="text-base">Manual fallback</CardTitle>
++            <CardDescription>
++              Only needed for local testing without going through the OAuth flow above.
++            </CardDescription>
++          </CardHeader>
++          <CardContent className="flex flex-col gap-5">
++            <div className="flex flex-col gap-1.5">
++              <Label htmlFor="username">Instagram username</Label>
++              <Input
++                id="username"
++                placeholder="myshop.official"
++                value={settings.username}
++                onChange={(e) => setSettings({ ...settings, username: e.target.value })}
++              />
++            </div>
++
++            <div className="flex flex-col gap-1.5">
++              <Label htmlFor="businessAccountId">Instagram business ID</Label>
++              <Input
++                id="businessAccountId"
++                placeholder="1784900000000123"
++                className="font-mono"
++                value={settings.businessAccountId}
++                onChange={(e) => setSettings({ ...settings, businessAccountId: e.target.value })}
++              />
++            </div>
++
++            <div className="flex flex-col gap-1.5">
++              <Label htmlFor="accessToken">Instagram access token</Label>
++              <Input
++                id="accessToken"
++                type="password"
++                placeholder="IGQ••••••••••••••••••••••••"
++                className="font-mono"
++                value={settings.accessToken}
++                onChange={(e) => setSettings({ ...settings, accessToken: e.target.value })}
++                autoComplete="off"
++              />
++              <p className="text-xs text-muted">
++                Leave untouched to keep whatever token is already stored (including one from OAuth above).
++              </p>
++            </div>
++          </CardContent>
++        </Card>
++
++        <div className="flex items-center gap-3">
++          <Button type="button" variant="outline" onClick={handleVerify} disabled={isVerifying}>
++            {isVerifying ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
++            {isVerifying ? "Verifying…" : "Verify connection"}
++          </Button>
++
++          <Button type="submit" disabled={saveStatus === "saving"}>
++            {saveStatus === "saving" && <Loader2 className="h-4 w-4 animate-spin" />}
++            {saveStatus === "saving" ? "Saving…" : "Save changes"}
++          </Button>
++
++          {saveStatus === "saved" && (
++            <span className="flex items-center gap-1.5 text-sm text-success">
++              <CheckCircle2 className="h-4 w-4" />
++              Saved
++            </span>
++          )}
++          {saveStatus === "error" && (
++            <span className="text-sm text-danger">Couldn&apos;t save. Please try again.</span>
++          )}
++        </div>
++      </form>
++    </div>
+   );
+ }
+diff --git a/src/features/settings/repositories/settings-repository.ts b/src/features/settings/repositories/settings-repository.ts
+index de35451..84cc4f6 100644
+--- a/src/features/settings/repositories/settings-repository.ts
++++ b/src/features/settings/repositories/settings-repository.ts
+@@ -1,24 +1,118 @@
++import { prisma } from "@/lib/db/prisma";
+ import type { InstagramSettings } from "@/features/settings/types";
++import { EMPTY_INSTAGRAM_SETTINGS, MASKED_TOKEN_PLACEHOLDER } from "@/features/settings/types";
+ 
+ /**
+- * In-memory placeholder for the InstagramSettings table. The schema
+- * already exists in Prisma; wiring this repository to real queries —
+- * and actually calling the Meta Graph API — is scoped to a later phase.
++ * Phase 2: real Prisma-backed reads/writes against `instagram_settings`,
++ * replacing the Phase 1 in-memory placeholder.
+  */
+-let currentSettings: InstagramSettings = {
+-  username: "",
+-  businessAccountId: "",
+-  accessToken: "",
+-  connectionState: "unverified",
+-};
+-
+-export async function getInstagramSettings(): Promise<InstagramSettings> {
+-  return currentSettings;
++
++function toFeatureShape(
++  row: {
++    username: string | null;
++    businessAccountId: string | null;
++    accessToken: string | null;
++    isConnected: boolean;
++    lastVerifiedAt: Date | null;
++  } | null
++): InstagramSettings {
++  if (!row) return EMPTY_INSTAGRAM_SETTINGS;
++
++  return {
++    username: row.username ?? "",
++    businessAccountId: row.businessAccountId ?? "",
++    // Never send the real token to the client — the UI only needs to know
++    // one is present.
++    accessToken: row.accessToken ? MASKED_TOKEN_PLACEHOLDER : "",
++    connectionState: row.isConnected ? "verified" : "unverified",
++    isConnected: row.isConnected,
++    lastVerifiedAt: row.lastVerifiedAt ? row.lastVerifiedAt.toISOString() : null,
++  };
++}
++
++export async function getInstagramSettings(userId: string): Promise<InstagramSettings> {
++  const row = await prisma.instagramSettings.findUnique({ where: { userId } });
++  return toFeatureShape(row);
++}
++
++/** Manual save from the settings form (username/business id/token typed by hand). */
++export async function saveInstagramSettingsManual(
++  userId: string,
++  settings: {
++    username: string;
++    businessAccountId: string;
++    /** undefined = leave the stored token untouched (e.g. masked value wasn't changed). */
++    accessToken: string | undefined;
++  }
++): Promise<InstagramSettings> {
++  const row = await prisma.instagramSettings.upsert({
++    where: { userId },
++    create: {
++      userId,
++      username: settings.username || null,
++      businessAccountId: settings.businessAccountId || null,
++      accessToken: settings.accessToken || null,
++      isConnected: false,
++    },
++    update: {
++      username: settings.username || null,
++      businessAccountId: settings.businessAccountId || null,
++      ...(settings.accessToken !== undefined
++        ? { accessToken: settings.accessToken || null, isConnected: false, lastVerifiedAt: null }
++        : {}),
++    },
++  });
++
++  return toFeatureShape(row);
+ }
+ 
+-export async function saveInstagramSettings(
+-  settings: InstagramSettings
++export async function markVerified(userId: string, isConnected: boolean): Promise<InstagramSettings> {
++  const row = await prisma.instagramSettings.update({
++    where: { userId },
++    data: { isConnected, lastVerifiedAt: isConnected ? new Date() : null },
++  });
++
++  return toFeatureShape(row);
++}
++
++/** Called by the OAuth callback once tokens + profile have been fetched from Meta. */
++export async function saveInstagramSettingsFromOAuth(
++  userId: string,
++  data: { username: string; igUserId: string; accessToken: string; tokenExpiresAt: Date }
+ ): Promise<InstagramSettings> {
+-  currentSettings = settings;
+-  return currentSettings;
++  const row = await prisma.instagramSettings.upsert({
++    where: { userId },
++    create: {
++      userId,
++      username: data.username,
++      businessAccountId: data.igUserId,
++      accessToken: data.accessToken,
++      tokenExpiresAt: data.tokenExpiresAt,
++      isConnected: true,
++      lastVerifiedAt: new Date(),
++    },
++    update: {
++      username: data.username,
++      businessAccountId: data.igUserId,
++      accessToken: data.accessToken,
++      tokenExpiresAt: data.tokenExpiresAt,
++      isConnected: true,
++      lastVerifiedAt: new Date(),
++    },
++  });
++
++  return toFeatureShape(row);
++}
++
++/**
++ * Routes an inbound webhook to the right tenant: Meta sends the receiving
++ * IG professional account's id as `entry[].id`, which we stored as
++ * `businessAccountId` when the owner connected their account.
++ */
++export async function findUserIdByIgBusinessAccountId(igBusinessAccountId: string): Promise<string | null> {
++  const row = await prisma.instagramSettings.findUnique({
++    where: { businessAccountId: igBusinessAccountId },
++    select: { userId: true },
++  });
++  return row?.userId ?? null;
+ }
+diff --git a/src/features/settings/services/settings-service.ts b/src/features/settings/services/settings-service.ts
+index db30a83..a4f3517 100644
+--- a/src/features/settings/services/settings-service.ts
++++ b/src/features/settings/services/settings-service.ts
+@@ -1,36 +1,67 @@
+ import {
+   getInstagramSettings,
+-  saveInstagramSettings,
++  saveInstagramSettingsManual,
++  markVerified,
+ } from "@/features/settings/repositories/settings-repository";
+-import type { InstagramSettings } from "@/features/settings/types";
++import {
++  EMPTY_INSTAGRAM_SETTINGS,
++  MASKED_TOKEN_PLACEHOLDER,
++  type InstagramSettings,
++} from "@/features/settings/types";
++import { getCurrentUser } from "@/lib/auth/current-user";
++
++type ManualFields = Pick<InstagramSettings, "username" | "businessAccountId" | "accessToken">;
++type ResolvedManualFields = Pick<InstagramSettings, "username" | "businessAccountId"> & {
++  /** undefined means "leave the stored token alone" (echoed-back mask, nothing typed). */
++  accessToken: string | undefined;
++};
++
++/**
++ * The settings form echoes back a masked placeholder for a token it never
++ * actually saw. Treat that as "leave the stored token alone" so a manual
++ * save/verify can't silently overwrite a real OAuth-issued token by
++ * accident.
++ */
++function resolveManualFields(current: InstagramSettings, incoming: ManualFields): ResolvedManualFields {
++  const untouched = incoming.accessToken === MASKED_TOKEN_PLACEHOLDER && current.accessToken === MASKED_TOKEN_PLACEHOLDER;
++  return {
++    username: incoming.username,
++    businessAccountId: incoming.businessAccountId,
++    accessToken: untouched ? undefined : incoming.accessToken,
++  };
++}
+ 
+ export async function fetchInstagramSettings(): Promise<InstagramSettings> {
+-  return getInstagramSettings();
++  const user = await getCurrentUser();
++  if (!user) return EMPTY_INSTAGRAM_SETTINGS;
++  return getInstagramSettings(user.id);
+ }
+ 
+-export async function updateInstagramSettings(
+-  settings: InstagramSettings
+-): Promise<InstagramSettings> {
+-  return saveInstagramSettings(settings);
++export async function updateInstagramSettings(settings: ManualFields): Promise<InstagramSettings> {
++  const user = await getCurrentUser();
++  if (!user) return EMPTY_INSTAGRAM_SETTINGS;
++
++  const current = await getInstagramSettings(user.id);
++  const resolved = resolveManualFields(current, settings);
++  return saveInstagramSettingsManual(user.id, resolved);
+ }
+ 
+ /**
+- * Simulates checking the Instagram connection. This never calls the
+- * Meta Graph API — it only checks that the required fields are present
+- * so the UI has something realistic to react to. Real verification is
+- * scoped to the Instagram OAuth phase.
++ * Manual-entry verification: since Phase 2's real connection now happens
++ * through OAuth (see /api/auth/instagram/connect), this just checks the
++ * hand-typed fields are non-empty, same as Phase 1. It does not call Meta.
+  */
+-export async function verifyInstagramConnection(
+-  settings: InstagramSettings
+-): Promise<InstagramSettings> {
++export async function verifyInstagramConnection(settings: ManualFields): Promise<InstagramSettings> {
++  const user = await getCurrentUser();
++  if (!user) return EMPTY_INSTAGRAM_SETTINGS;
++
++  const current = await getInstagramSettings(user.id);
++  const resolved = resolveManualFields(current, settings);
++
+   const hasAllFields = Boolean(
+-    settings.username.trim() && settings.businessAccountId.trim() && settings.accessToken.trim()
++    resolved.username.trim() && resolved.businessAccountId.trim() && (resolved.accessToken ?? current.accessToken).trim()
+   );
+ 
+-  const updated: InstagramSettings = {
+-    ...settings,
+-    connectionState: hasAllFields ? "verified" : "failed",
+-  };
+-
+-  return saveInstagramSettings(updated);
++  await saveInstagramSettingsManual(user.id, resolved);
++  return markVerified(user.id, hasAllFields);
+ }
+diff --git a/src/features/settings/types/index.ts b/src/features/settings/types/index.ts
+index bcc1227..9f27219 100644
+--- a/src/features/settings/types/index.ts
++++ b/src/features/settings/types/index.ts
+@@ -5,4 +5,24 @@ export type InstagramSettings = {
+   businessAccountId: string;
+   accessToken: string;
+   connectionState: InstagramConnectionState;
++  /** True once a real OAuth token has been stored (Phase 2). */
++  isConnected: boolean;
++  lastVerifiedAt: string | null;
+ };
++
++export const EMPTY_INSTAGRAM_SETTINGS: InstagramSettings = {
++  username: "",
++  businessAccountId: "",
++  accessToken: "",
++  connectionState: "unverified",
++  isConnected: false,
++  lastVerifiedAt: null,
++};
++
++/**
++ * Placeholder the repository sends back instead of a real access token, so
++ * the real secret never round-trips to the browser. The settings service
++ * uses this to detect "user didn't actually change the token" and avoid
++ * clobbering a real OAuth-issued token with a manual save.
++ */
++export const MASKED_TOKEN_PLACEHOLDER = "••••••••••••••••";
+diff --git a/src/lib/auth/current-user.ts b/src/lib/auth/current-user.ts
+new file mode 100644
+index 0000000..a02b2d7
+--- /dev/null
++++ b/src/lib/auth/current-user.ts
+@@ -0,0 +1,14 @@
++import { prisma } from "@/lib/db/prisma";
++import { getSession } from "@/lib/auth/session";
++
++/**
++ * The session JWT only carries { email, name } (Phase 1 dummy auth).
++ * Repositories need a real userId for Prisma queries, so this resolves
++ * the current session back to its User row.
++ */
++export async function getCurrentUser() {
++  const session = await getSession();
++  if (!session) return null;
++
++  return prisma.user.findUnique({ where: { email: session.email } });
++}
+diff --git a/src/lib/format-time.ts b/src/lib/format-time.ts
+new file mode 100644
+index 0000000..f04b01c
+--- /dev/null
++++ b/src/lib/format-time.ts
+@@ -0,0 +1,24 @@
++/** "2m", "3h", "Monday", "Yesterday" style relative label for a conversation list row. */
++export function formatRelativeLabel(date: Date): string {
++  const diffMs = Date.now() - date.getTime();
++  const diffMinutes = Math.floor(diffMs / 60_000);
++
++  if (diffMinutes < 1) return "now";
++  if (diffMinutes < 60) return `${diffMinutes}m`;
++
++  const diffHours = Math.floor(diffMinutes / 60);
++  if (diffHours < 24) return `${diffHours}h`;
++
++  const diffDays = Math.floor(diffHours / 24);
++  if (diffDays === 1) return "Yesterday";
++  if (diffDays < 7) {
++    return date.toLocaleDateString("en-US", { weekday: "long" });
++  }
++
++  return date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
++}
++
++/** "10:02 AM" style label for an individual message bubble. */
++export function formatClockTime(date: Date): string {
++  return date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
++}
+diff --git a/src/lib/instagram/config.ts b/src/lib/instagram/config.ts
+new file mode 100644
+index 0000000..d8c533e
+--- /dev/null
++++ b/src/lib/instagram/config.ts
+@@ -0,0 +1,44 @@
++/**
++ * Config for the "Instagram API with Instagram Login" flow (graph.instagram.com).
++ * This is the current (2026) Meta-recommended path for a single Instagram
++ * professional account to authorize an app directly — no Facebook Page or
++ * Facebook Login required. See:
++ * https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/
++ */
++
++function required(name: string): string {
++  const value = process.env[name];
++  if (!value) {
++    throw new Error(
++      `Missing required env var "${name}". Copy .env.example to .env and fill in your Meta App credentials.`
++    );
++  }
++  return value;
++}
++
++export const instagramConfig = {
++  get appId() {
++    return required("INSTAGRAM_APP_ID");
++  },
++  get appSecret() {
++    return required("INSTAGRAM_APP_SECRET");
++  },
++  get redirectUri() {
++    return required("INSTAGRAM_REDIRECT_URI");
++  },
++  get webhookVerifyToken() {
++    return required("INSTAGRAM_WEBHOOK_VERIFY_TOKEN");
++  },
++};
++
++/** Scopes needed to receive and (eventually) send DMs. */
++export const INSTAGRAM_OAUTH_SCOPES = [
++  "instagram_business_basic",
++  "instagram_business_manage_messages",
++];
++
++export const INSTAGRAM_AUTH_URL = "https://www.instagram.com/oauth/authorize";
++export const INSTAGRAM_TOKEN_URL = "https://api.instagram.com/oauth/access_token";
++export const INSTAGRAM_GRAPH_URL = "https://graph.instagram.com";
++
++export const OAUTH_STATE_COOKIE_NAME = "ig_oauth_state";
+diff --git a/src/lib/instagram/oauth.ts b/src/lib/instagram/oauth.ts
+new file mode 100644
+index 0000000..6c46cc4
+--- /dev/null
++++ b/src/lib/instagram/oauth.ts
+@@ -0,0 +1,99 @@
++import {
++  INSTAGRAM_AUTH_URL,
++  INSTAGRAM_GRAPH_URL,
++  INSTAGRAM_OAUTH_SCOPES,
++  INSTAGRAM_TOKEN_URL,
++  instagramConfig,
++} from "@/lib/instagram/config";
++
++/** Step 1: where we send the user to authorize the app. */
++export function buildInstagramAuthorizationUrl(state: string): string {
++  const url = new URL(INSTAGRAM_AUTH_URL);
++  url.searchParams.set("client_id", instagramConfig.appId);
++  url.searchParams.set("redirect_uri", instagramConfig.redirectUri);
++  url.searchParams.set("response_type", "code");
++  url.searchParams.set("scope", INSTAGRAM_OAUTH_SCOPES.join(","));
++  url.searchParams.set("state", state);
++  return url.toString();
++}
++
++type ShortLivedTokenResponse = {
++  data?: Array<{ access_token: string; user_id: string; permissions?: string[] }>;
++  access_token?: string;
++  user_id?: string;
++};
++
++/** Step 2: exchange the ?code= from the callback for a short-lived token. */
++export async function exchangeCodeForShortLivedToken(
++  code: string
++): Promise<{ accessToken: string; userId: string }> {
++  const body = new URLSearchParams({
++    client_id: instagramConfig.appId,
++    client_secret: instagramConfig.appSecret,
++    grant_type: "authorization_code",
++    redirect_uri: instagramConfig.redirectUri,
++    code,
++  });
++
++  const response = await fetch(INSTAGRAM_TOKEN_URL, {
++    method: "POST",
++    headers: { "Content-Type": "application/x-www-form-urlencoded" },
++    body,
++  });
++
++  const json = (await response.json().catch(() => null)) as ShortLivedTokenResponse | null;
++
++  if (!response.ok || !json) {
++    throw new Error(`Instagram token exchange failed: ${response.status} ${JSON.stringify(json)}`);
++  }
++
++  // Meta has shipped this endpoint returning either a flat object or a
++  // `data: [...]` wrapper at different times — handle both defensively.
++  const entry = json.data?.[0] ?? json;
++  if (!entry?.access_token || !entry.user_id) {
++    throw new Error(`Instagram token exchange returned an unexpected shape: ${JSON.stringify(json)}`);
++  }
++
++  return { accessToken: entry.access_token, userId: String(entry.user_id) };
++}
++
++/** Step 3: trade the short-lived token for a 60-day long-lived token. */
++export async function exchangeForLongLivedToken(
++  shortLivedToken: string
++): Promise<{ accessToken: string; expiresInSeconds: number }> {
++  const url = new URL(`${INSTAGRAM_GRAPH_URL}/access_token`);
++  url.searchParams.set("grant_type", "ig_exchange_token");
++  url.searchParams.set("client_secret", instagramConfig.appSecret);
++  url.searchParams.set("access_token", shortLivedToken);
++
++  const response = await fetch(url.toString());
++  const json = (await response.json().catch(() => null)) as
++    | { access_token: string; token_type: string; expires_in: number }
++    | null;
++
++  if (!response.ok || !json?.access_token) {
++    throw new Error(`Instagram long-lived token exchange failed: ${response.status} ${JSON.stringify(json)}`);
++  }
++
++  return { accessToken: json.access_token, expiresInSeconds: json.expires_in };
++}
++
++/** Step 4: fetch the connected account's username so the UI has something to show. */
++export async function fetchInstagramProfile(
++  accessToken: string
++): Promise<{ userId: string; username: string }> {
++  const url = new URL(`${INSTAGRAM_GRAPH_URL}/me`);
++  url.searchParams.set("fields", "user_id,username");
++  url.searchParams.set("access_token", accessToken);
++
++  const response = await fetch(url.toString());
++  const json = (await response.json().catch(() => null)) as
++    | { user_id: string; username: string }
++    | null;
++
++  if (!response.ok || !json) {
++    throw new Error(`Fetching Instagram profile failed: ${response.status} ${JSON.stringify(json)}`);
++  }
++
++  return { userId: String(json.user_id), username: json.username };
++}
+diff --git a/src/lib/instagram/webhook-types.ts b/src/lib/instagram/webhook-types.ts
+new file mode 100644
+index 0000000..146f9a4
+--- /dev/null
++++ b/src/lib/instagram/webhook-types.ts
+@@ -0,0 +1,56 @@
++/** Shape of the messaging webhook Meta sends for the "instagram" object, "messages" field. */
++export type InstagramWebhookPayload = {
++  object: string;
++  entry: Array<{
++    id: string; // the receiving IG professional account's id
++    time: number;
++    messaging?: Array<{
++      sender: { id: string }; // IGSID of the customer
++      recipient: { id: string }; // the IG professional account's id
++      timestamp: number;
++      message?: {
++        mid: string;
++        text?: string;
++        is_echo?: boolean; // true for messages the business itself sent
++        attachments?: Array<{ type: string; payload?: { url?: string } }>;
++      };
++    }>;
++  }>;
++};
++
++export type ParsedIncomingMessage = {
++  igBusinessAccountId: string;
++  senderIgsid: string;
++  content: string;
++  createdAt: Date;
++};
++
++/**
++ * Flattens a webhook payload into individual inbound customer messages,
++ * skipping echoes (messages the business itself sent, which Meta also
++ * delivers here) since Phase 2 only cares about DMs landing from customers.
++ */
++export function parseIncomingMessages(payload: InstagramWebhookPayload): ParsedIncomingMessage[] {
++  const results: ParsedIncomingMessage[] = [];
++
++  for (const entry of payload.entry ?? []) {
++    for (const event of entry.messaging ?? []) {
++      if (!event.message || event.message.is_echo) continue;
++
++      const content =
++        event.message.text ??
++        (event.message.attachments?.length ? `[${event.message.attachments[0].type} attachment]` : "");
++
++      if (!content) continue;
++
++      results.push({
++        igBusinessAccountId: entry.id,
++        senderIgsid: event.sender.id,
++        content,
++        createdAt: new Date(event.timestamp),
++      });
++    }
++  }
++
++  return results;
++}
+diff --git a/src/lib/instagram/webhook-verify.ts b/src/lib/instagram/webhook-verify.ts
+new file mode 100644
+index 0000000..c4bbd3b
+--- /dev/null
++++ b/src/lib/instagram/webhook-verify.ts
+@@ -0,0 +1,23 @@
++import { createHmac, timingSafeEqual } from "node:crypto";
++import { instagramConfig } from "@/lib/instagram/config";
++
++/**
++ * Verifies the `X-Hub-Signature-256` header Meta sends on every webhook
++ * POST, computed as HMAC-SHA256 of the *raw* request body using the app
++ * secret. Must run against the raw bytes — parsing to JSON first and
++ * re-stringifying will not reproduce the same signature.
++ */
++export function verifyInstagramWebhookSignature(rawBody: string, signatureHeader: string | null): boolean {
++  if (!signatureHeader) return false;
++
++  const [scheme, signature] = signatureHeader.split("=");
++  if (scheme !== "sha256" || !signature) return false;
++
++  const expectedSignature = createHmac("sha256", instagramConfig.appSecret).update(rawBody, "utf8").digest("hex");
++
++  const provided = Buffer.from(signature, "hex");
++  const expected = Buffer.from(expectedSignature, "hex");
++
++  if (provided.length !== expected.length) return false;
++  return timingSafeEqual(provided, expected);
++}
+-- 
+2.43.0
+
