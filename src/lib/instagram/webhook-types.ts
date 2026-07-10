@@ -71,7 +71,7 @@ export function parseIncomingMessages(payload: InstagramWebhookPayload): ParsedI
         (event.message.attachments?.length ? `[${event.message.attachments[0].type} attachment]` : "");
 
       if (!content) continue;
-
+      
       results.push({
         igBusinessAccountId: entry.id,
         senderIgsid: event.sender.id,
