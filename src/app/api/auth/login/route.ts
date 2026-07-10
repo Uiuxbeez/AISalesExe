@@ -1,8 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import {
-  getDummyAccountName,
-  validateCredentials,
-} from "@/features/auth/services/auth-service";
+import { validateCredentials } from "@/features/auth/services/auth-service";
 import { createSession } from "@/lib/auth/session";
 
 export async function POST(request: NextRequest) {
@@ -15,13 +12,13 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const result = validateCredentials({ email: body.email, password: body.password });
+  const result = await validateCredentials({ email: body.email, password: body.password });
 
   if (!result.success) {
     return NextResponse.json(result, { status: 401 });
   }
 
-  await createSession({ email: body.email.trim().toLowerCase(), name: getDummyAccountName() });
+  await createSession({ email: body.email.trim().toLowerCase(), name: result.name });
 
   return NextResponse.json({ success: true });
 }

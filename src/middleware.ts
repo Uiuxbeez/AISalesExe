@@ -3,6 +3,7 @@ import { verifySession } from "@/lib/auth/jwt";
 import { SESSION_COOKIE_NAME } from "@/lib/auth/session";
 
 const PROTECTED_PATHS = ["/dashboard", "/inbox", "/ai-brain", "/settings"];
+const AUTH_PATHS = ["/login", "/signup"];
 
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
@@ -10,7 +11,7 @@ export async function middleware(request: NextRequest) {
   const session = await verifySession(token);
 
   const isProtected = PROTECTED_PATHS.some((path) => pathname.startsWith(path));
-  const isLoginPage = pathname === "/login";
+  const isAuthPage = AUTH_PATHS.some((path) => pathname.startsWith(path));
 
   if (isProtected && !session) {
     const loginUrl = new URL("/login", request.url);
@@ -18,7 +19,7 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(loginUrl);
   }
 
-  if (isLoginPage && session) {
+  if (isAuthPage && session) {
     return NextResponse.redirect(new URL("/dashboard", request.url));
   }
 
@@ -26,5 +27,5 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/dashboard/:path*", "/inbox/:path*", "/ai-brain/:path*", "/settings/:path*", "/login"],
+  matcher: ["/dashboard/:path*", "/inbox/:path*", "/ai-brain/:path*", "/settings/:path*", "/login", "/signup"],
 };

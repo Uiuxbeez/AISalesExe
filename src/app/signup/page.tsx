@@ -1,8 +1,8 @@
 import Link from "next/link";
 import { MessageSquareText } from "lucide-react";
-import { LoginForm } from "@/features/auth/components/login-form";
+import { SignupForm } from "@/features/auth/components/signup-form";
 
-export default function LoginPage() {
+export default function SignupPage() {
   return (
     <div className="flex min-h-screen">
       <div className="hidden w-[42%] flex-col justify-between bg-sidebar px-12 py-12 text-sidebar-foreground lg:flex">
@@ -15,11 +15,11 @@ export default function LoginPage() {
 
         <div className="max-w-sm">
           <p className="font-display text-3xl font-semibold leading-tight">
-            Your Instagram DMs, handled like your best salesperson never sleeps.
+            One account per business. Your Instagram, your conversations, your AI.
           </p>
           <p className="mt-4 text-sm text-sidebar-muted">
-            Connect an Instagram Business account, teach your AI how to sell, and let it
-            reply to every customer conversation the moment it lands.
+            Every business gets its own isolated workspace — connect one Instagram
+            account and manage its conversations without touching anyone else&apos;s.
           </p>
         </div>
 
@@ -29,16 +29,16 @@ export default function LoginPage() {
       <div className="flex flex-1 items-center justify-center bg-paper px-6 py-12">
         <div className="w-full max-w-sm">
           <div className="mb-8">
-            <h1 className="font-display text-2xl font-semibold text-ink">Sign in</h1>
-            <p className="mt-1 text-sm text-muted">Welcome back. Enter your details to continue.</p>
+            <h1 className="font-display text-2xl font-semibold text-ink">Create your account</h1>
+            <p className="mt-1 text-sm text-muted">Set up your business workspace.</p>
           </div>
 
-          <LoginForm />
+          <SignupForm />
 
           <p className="mt-6 text-center text-sm text-muted">
-            New here?{" "}
-            <Link href="/signup" className="font-medium text-accent hover:underline">
-              Create a business account
+            Already have an account?{" "}
+            <Link href="/login" className="font-medium text-accent hover:underline">
+              Sign in
             </Link>
           </p>
         </div>
