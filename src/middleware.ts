@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { verifySession } from "@/lib/auth/jwt";
 import { SESSION_COOKIE_NAME } from "@/lib/auth/session";
 
-const PROTECTED_PATHS = ["/dashboard", "/inbox", "/ai-brain", "/settings"];
+const PROTECTED_PATHS = ["/dashboard", "/inbox", "/ai-brain", "/settings", "/account"];
 const AUTH_PATHS = ["/login", "/signup"];
 
 export async function middleware(request: NextRequest) {
@@ -27,5 +27,13 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/dashboard/:path*", "/inbox/:path*", "/ai-brain/:path*", "/settings/:path*", "/login", "/signup"],
+  matcher: [
+    "/dashboard/:path*",
+    "/inbox/:path*",
+    "/ai-brain/:path*",
+    "/settings/:path*",
+    "/account/:path*",
+    "/login",
+    "/signup",
+  ],
 };

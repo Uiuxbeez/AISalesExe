@@ -8,6 +8,7 @@ const PAGE_DESCRIPTIONS: Record<string, string> = {
   "/inbox": "Every customer conversation, in one place.",
   "/ai-brain": "Configure how your AI sales executive thinks and responds.",
   "/settings": "Manage your Instagram connection.",
+  "/account": "Manage your profile and password.",
 };
 
 export function Topbar() {

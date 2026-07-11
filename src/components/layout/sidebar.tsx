@@ -8,7 +8,7 @@ import { NAV_ITEMS } from "@/components/layout/nav-items";
 import { LogoutButton } from "@/components/layout/logout-button";
 import { StatusPulse } from "@/components/ui/status-pulse";
 
-export function Sidebar({ userName }: { userName: string }) {
+export function Sidebar({ userName, userEmail }: { userName: string; userEmail: string }) {
   const pathname = usePathname();
 
   return (
@@ -47,7 +47,7 @@ export function Sidebar({ userName }: { userName: string }) {
         <div className="mb-3 flex items-center justify-between rounded-md px-3 py-2">
           <div className="min-w-0">
             <p className="truncate text-sm font-medium text-sidebar-foreground">{userName}</p>
-            <p className="truncate text-xs text-sidebar-muted">admin@example.com</p>
+            <p className="truncate text-xs text-sidebar-muted">{userEmail}</p>
           </div>
         </div>
         <div className="mb-2 px-3">
